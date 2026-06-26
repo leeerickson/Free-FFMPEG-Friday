@@ -1,0 +1,71 @@
+@echo off
+setlocal
+
+REM ##############################################################################
+REM #                                                                            #
+REM #         4K 60fps HEVC 10-bit Video Converter using FFmpeg 8.0+             #
+REM #                                                                            #
+REM ##############################################################################
+REM #                                                                            #
+REM #  Instructions:                                                             #
+REM #  1. Ensure FFmpeg is installed and accessible in your system's PATH.       #
+REM #  2. Save this file as "4k_converter.bat".                                  #
+REM #  3. Drag and drop a single video file onto this batch file icon.           #
+REM #  4. The script will create a new file in the same directory with           #
+REM #     "_4k_60fps_hevc" appended to the original filename.                    #
+REM #                                                                            #
+REM ##############################################################################
+
+REM --- Check if a file was dropped on the script ---
+if "%~1"=="" (
+    echo.
+    echo ERROR: You need to drag and drop a video file onto this script.
+    echo.
+    echo Press any key to exit.
+    pause >nul
+    exit /b
+)
+
+REM --- Set Input and Output Filenames ---
+set "inputFile=%~1"
+set "outputFile=%~dpn1_4k_60fps_hevc_422.mp4"
+
+echo.
+echo =======================================================
+echo         Starting Video Conversion
+echo =======================================================
+echo.
+echo Input File: %inputFile%
+echo.
+echo Output File: %outputFile%
+echo.
+echo =======================================================
+echo.
+
+
+REM --- FFmpeg Command ---
+REM -i "%inputFile%"                  : Specifies the input file.
+REM -vf "scale=3840:2160:flags=lanczos,unsharp=5:5:1.0,fps=60" : Video filtergraph.
+REM    - scale=3840:2160:flags=lanczos : Scales video to 4K UHD (3840x2160) using the high-quality Lanczos algorithm.
+REM    - unsharp=5:5:1.0               : Adds a gentle sharpening to enhance details after upscaling.
+REM    - fps=60                        : Converts the frame rate to 60 fps.
+REM -c:v libx265                      : Sets the video codec to HEVC (H.265). Requires a version of FFmpeg compiled with libx265.
+REM -preset fast                      : A faster preset for a good balance between speed and quality. (Options: ultrafast...slow...veryslow)
+REM -crf 16                           : Constant Rate Factor. Controls quality. Lower is better. 16 is near-visually lossless for high-quality sources. File size will be large.
+REM -pix_fmt yuv422p10le              : Sets the pixel format to YUV 4:2:2 with 10-bit color depth (le = little-endian). This retains more color information than 4:2:0.
+REM -c:a copy                         : Copies the audio stream without re-encoding to preserve its original quality.
+REM -map 0                            : Selects all available streams (video, audio, subtitles) from the input file to be included in the output.
+REM "%outputFile%"                    : Specifies the output file name and path.
+
+ffmpeg -i "%inputFile%" -vf "scale=3840:2160:flags=lanczos,unsharp=5:5:1.0,fps=60" -c:v libx265 -preset fast -crf 16 -pix_fmt yuv422p10le -c:a copy -map 0 "%outputFile%"
+
+
+echo.
+echo =======================================================
+echo Conversion Finished!
+echo =======================================================
+echo.
+
+REM --- Keep the window open to see the output ---
+pause
+
