@@ -20,10 +20,6 @@ concurrency:
   group: srt-streamer-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # BtbN GPL build: includes libsrt (SRT) and ddagrab (GPU screen capture).
-  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip
-
 jobs:
   linux:
     name: Linux self-test (x11grab)
@@ -63,8 +59,18 @@ jobs:
           python-version: "3.12"
 
       - name: Download FFmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
+          # BtbN GPL builds include libsrt (SRT) and ddagrab (GPU capture). Asset names change with
+          # each FFmpeg release, so pick the newest stable win64 GPL zip from the latest release.
+          $assets = gh release view latest --repo BtbN/FFmpeg-Builds --json assets --jq '.assets[].name'
+          $stable = $assets | Where-Object { $_ -match '^ffmpeg-n(\d+)\.(\d+)\S*-win64-gpl-[\d.]+\.zip$' } |
+            Sort-Object { $null = $_ -match '^ffmpeg-n(\d+)\.(\d+)'; [int]$Matches[1] * 1000 + [int]$Matches[2] } |
+            Select-Object -Last 1
+          $name = if ($stable) { $stable } else { "ffmpeg-master-latest-win64-gpl.zip" }
+          Write-Host "Using FFmpeg build: $name"
+          gh release download latest --repo BtbN/FFmpeg-Builds --pattern $name --output ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffdl
           $bin = Get-ChildItem ffdl -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           New-Item -ItemType Directory -Force vendor | Out-Null
