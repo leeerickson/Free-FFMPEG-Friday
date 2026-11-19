@@ -1,0 +1,160 @@
+name: SRT Streamer
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "srt-streamer/**"
+      - ".github/workflows/srt-streamer.yml"
+    tags: ["srt-streamer-v*"]   # path filters are not applied to tag pushes
+  pull_request:
+    paths:
+      - "srt-streamer/**"
+      - ".github/workflows/srt-streamer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: srt-streamer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # BtbN GPL build: includes libsrt (SRT) and ddagrab (GPU screen capture).
+  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip
+
+jobs:
+  linux:
+    name: Linux self-test (x11grab)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: srt-streamer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg, Tk and a virtual display
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg xvfb python3-tk
+      - name: Self-test
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" /usr/bin/python3 srt_streamer.py --self-test out/linux-x11grab.json --capture x11grab
+      - name: Show report
+        if: always()
+        run: cat out/*.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-linux
+          path: srt-streamer/out/
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows build + self-test
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: srt-streamer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download FFmpeg
+        run: |
+          Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffdl
+          $bin = Get-ChildItem ffdl -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force vendor | Out-Null
+          Copy-Item $bin.FullName vendor/
+          Copy-Item (Join-Path $bin.Directory.Parent.FullName "LICENSE.txt") vendor/FFMPEG-LICENSE.txt
+          & vendor/ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          if (-not (& vendor/ffmpeg.exe -hide_banner -protocols | Select-String -Pattern '^\s*srt\s*$')) { throw "FFmpeg build has no SRT" }
+          if (-not (& vendor/ffmpeg.exe -hide_banner -filters | Select-String -Pattern '\sddagrab\s')) { throw "FFmpeg build has no ddagrab" }
+          "$PWD\vendor" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Self-test from source (GDI capture)
+        run: python srt_streamer.py --self-test out/source-gdigrab.json --capture gdigrab
+
+      - name: Self-test from source (GPU capture, ddagrab)
+        # Hosted runners have no GPU; Desktop Duplication may or may not work there.
+        continue-on-error: true
+        run: python srt_streamer.py --self-test out/source-ddagrab.json --capture ddagrab
+
+      - name: Build single-file exe (FFmpeg bundled)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller==6.11.1"
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name "SRT Streamer" `
+            --icon assets/icon.ico `
+            --version-file packaging/version_info.txt `
+            --add-binary "vendor/ffmpeg.exe;." `
+            --hidden-import selftest `
+            srt_streamer.py
+          Get-Item "dist/SRT Streamer.exe" | Format-List Name, Length
+
+      - name: Self-test the built exe (GDI capture)
+        run: |
+          $report = "$PWD\out\exe-gdigrab.json"
+          $p = Start-Process -FilePath "dist\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "gdigrab" -Wait -PassThru
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "exe self-test failed (exit $($p.ExitCode))" }
+          $ff = (Get-Content $report | ConvertFrom-Json).info.ffmpeg
+          if ($ff -notmatch '_MEI') { throw "exe did not use its bundled FFmpeg: $ff" }
+
+      - name: Self-test the built exe (GPU capture, ddagrab)
+        continue-on-error: true
+        run: |
+          $report = "$PWD\out\exe-ddagrab.json"
+          $p = Start-Process -FilePath "dist\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "ddagrab" -Wait -PassThru
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "exe ddagrab self-test failed (exit $($p.ExitCode))" }
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item "dist/SRT Streamer.exe" pkg/
+          Copy-Item vendor/FFMPEG-LICENSE.txt pkg/
+          Copy-Item packaging/README-windows.txt pkg/README.txt
+          Compress-Archive -Path pkg/* -DestinationPath SRT-Streamer-Windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SRT-Streamer-Windows-x64
+          path: srt-streamer/SRT-Streamer-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-windows
+          path: srt-streamer/out/
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/srt-streamer-v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches APP_VERSION
+        run: |
+          want="${GITHUB_REF_NAME#srt-streamer-v}"
+          have=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' srt-streamer/srt_streamer.py)
+          echo "tag=$want app=$have"
+          test "$want" = "$have"
+      - uses: actions/download-artifact@v4
+        with:
+          name: SRT-Streamer-Windows-x64
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" SRT-Streamer-Windows-x64.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SRT Streamer ${GITHUB_REF_NAME#srt-streamer-v}" \
+            --notes "Windows x64 build with FFmpeg (SRT + GPU capture) bundled. Built and self-tested by GitHub Actions on Windows Server 2022."
