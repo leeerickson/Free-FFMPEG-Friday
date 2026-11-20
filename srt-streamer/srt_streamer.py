@@ -103,19 +103,29 @@ def find_ffmpeg():
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
-def find_slt():
-    """srt-live-transmit, for detailed SRT link statistics: next to the app, bundled, or on PATH."""
-    exe = "srt-live-transmit.exe" if SYSTEM == "Windows" else "srt-live-transmit"
+def find_libsrt():
+    """The SRT library: next to the app, bundled in the exe, or installed on the system."""
+    names = {"Windows": ["libsrt.dll", "srt.dll"],
+             "Darwin": ["libsrt.dylib", "libsrt.1.5.dylib"]}.get(SYSTEM, ["libsrt.so.1.5", "libsrt.so"])
     here = os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
     bases = [here, os.path.dirname(here)]
     if getattr(sys, "_MEIPASS", None):
         bases.append(sys._MEIPASS)
     for base in bases:
-        for sub in ("", "srt", "bin"):
-            cand = os.path.join(base, sub, exe)
-            if os.path.isfile(cand):
-                return cand
-    return shutil.which("srt-live-transmit") or ""
+        for sub in ("", "srt", "lib"):
+            for n in names:
+                cand = os.path.join(base, sub, n)
+                if os.path.isfile(cand):
+                    return cand
+    import ctypes.util
+    for n in ("srt", "srt-openssl", "srt-gnutls"):
+        found = ctypes.util.find_library(n)
+        if found:
+            return found
+    for cand in ("/opt/homebrew/lib/libsrt.dylib", "/usr/local/lib/libsrt.dylib"):
+        if os.path.isfile(cand):
+            return cand
+    return ""
 
 
 def ffmpeg_exists(path):
@@ -144,7 +154,7 @@ DEFAULTS = {
     "streamid": "",
     "reconnect": True,
     "srt_stats": True,
-    "slt": find_slt(),
+    "srt_lib": find_libsrt(),
 }
 
 
@@ -750,13 +760,6 @@ def enumerate_sources(ff):
     return video, audio, notes
 
 
-def check_slt(path):
-    if not path:
-        return None
-    m = re.search(r"SRT Library version:\s*([\w.]+)", run_quiet([path, "-version"]))
-    return m.group(1) if m else None
-
-
 def check_ffmpeg(ff):
     out = run_quiet([ff, "-hide_banner", "-version"])
     if not out.strip() or "ffmpeg version" not in out:
@@ -838,31 +841,8 @@ def preview_output_args(size, fps=6):
             "-c:v", "ppm", "-f", "image2pipe", "pipe:1"]
 
 
-def use_slt(s):
-    return bool(s.get("srt_stats") and s.get("slt"))
-
-
-def slt_report_every(s):
-    """srt-live-transmit reports stats every N packets; aim for about one report per second."""
-    try:
-        kbps = float(s["vbitrate"]) + float(s["abitrate"])
-    except (KeyError, ValueError):
-        kbps = 4000
-    return max(20, int(kbps * 1000 / 8 / 1316))
-
-
-def build_slt_command(s, udp_port, mask_secrets=False):
-    """srt-live-transmit: takes FFmpeg's MPEG-TS over local UDP and sends it over SRT,
-    printing JSON link statistics (RTT, loss, retransmits, buffer, bandwidth) on stdout."""
-    mode, host, port = s["mode"], s["host"].strip(), int(s["port"])
-    target = f"srt://{format_host(host) if host else ''}:{port}"
-    params = [f"mode={mode}", f"latency={int(float(s['latency']))}"]  # milliseconds here
-    if s["passphrase"]:
-        params += [f"passphrase={'********' if mask_secrets else s['passphrase']}", f"pbkeylen={s['pbkeylen']}"]
-    if s["streamid"].strip():
-        params.append(f"streamid={s['streamid'].strip()}")
-    return [s["slt"] or "srt-live-transmit", f"-s:{slt_report_every(s)}", "-pf:json", "-f", "-a:no",
-            f"udp://127.0.0.1:{udp_port}?rcvbuf=8388608", target + "?" + "&".join(params)]
+def use_srt_stats(s):
+    return bool(s.get("srt_stats") and s.get("srt_lib"))
 
 
 def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None, udp_port=None):
@@ -871,8 +851,8 @@ def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None
     stream=True   -> encode and send to SRT (plus an optional preview output)
     stream=False  -> preview only (frames to stdout, audio levels to the log)
     preview=(w,h) -> add a low-rate raw-frame output on stdout for the confidence monitor
-    udp_port      -> hand MPEG-TS to srt-live-transmit on this local UDP port instead of
-                     using FFmpeg's own SRT output
+    udp_port      -> hand MPEG-TS to SRT Streamer's own SRT sender (libsrt, with statistics) on
+                     this local UDP port instead of using FFmpeg's built-in SRT output
     """
     enc = s["encoder"].split()[0]
     fps = int(float(s["fps"]))
@@ -998,53 +978,239 @@ def recommend_latency(rtt_ms, loss_pct=0.0):
     return int(-(-max(120.0, mult * rtt_ms) // 10) * 10)
 
 
-TS_NULL_PACKETS = (b"\x47\x1f\xff\x10" + b"\xff" * 184) * 7  # 7 MPEG-TS null packets = 1316 bytes
+# ==========================================================================
+# libsrt (via ctypes): our own SRT sender with full link statistics
+# ==========================================================================
+SRTO_RENDEZVOUS, SRTO_SENDER, SRTO_LATENCY, SRTO_PASSPHRASE = 12, 21, 23, 26
+SRTO_PBKEYLEN, SRTO_CONNTIMEO, SRTO_STREAMID = 27, 36, 46
+SRTS_BROKEN = 6
+_SRT_STATS_FIELDS = (  # SRT_TRACEBSTATS (srt.h), in order, through msSndBuf
+    "q msTimeStamp q pktSentTotal q pktRecvTotal i pktSndLossTotal i pktRcvLossTotal i pktRetransTotal "
+    "i pktSentACKTotal i pktRecvACKTotal i pktSentNAKTotal i pktRecvNAKTotal q usSndDurationTotal "
+    "i pktSndDropTotal i pktRcvDropTotal i pktRcvUndecryptTotal Q byteSentTotal Q byteRecvTotal "
+    "Q byteRcvLossTotal Q byteRetransTotal Q byteSndDropTotal Q byteRcvDropTotal Q byteRcvUndecryptTotal "
+    "q pktSent q pktRecv i pktSndLoss i pktRcvLoss i pktRetrans i pktRcvRetrans i pktSentACK i pktRecvACK "
+    "i pktSentNAK i pktRecvNAK d mbpsSendRate d mbpsRecvRate q usSndDuration i pktReorderDistance "
+    "d pktRcvAvgBelatedTime q pktRcvBelated i pktSndDrop i pktRcvDrop i pktRcvUndecrypt Q byteSent "
+    "Q byteRecv Q byteRcvLoss Q byteRetrans Q byteSndDrop Q byteRcvDrop Q byteRcvUndecrypt "
+    "d usPktSndPeriod i pktFlowWindow i pktCongestionWindow i pktFlightSize d msRTT d mbpsBandwidth "
+    "i byteAvailSndBuf i byteAvailRcvBuf d mbpsMaxBW i byteMSS i pktSndBuf i byteSndBuf i msSndBuf").split()
 
 
-class PaddingRelay(threading.Thread):
-    """Forwards FFmpeg's MPEG-TS from one local UDP port to another and tops it up with MPEG-TS
-    null packets (which receivers discard) to hit an adjustable total bitrate."""
+_SRT_LIBS = {}
 
-    def __init__(self, in_port, out_port):
+
+class SrtLib:
+    """Thin ctypes binding for the parts of libsrt the sender needs."""
+
+    def __init__(self, path):
+        import ctypes as c
+        if SYSTEM == "Windows" and os.path.isabs(path):
+            os.add_dll_directory(os.path.dirname(path))  # its DLLs (OpenSSL, C++ runtime) sit beside it
+        lib = c.CDLL(path)
+        sigs = {"srt_startup": (c.c_int, []), "srt_create_socket": (c.c_int, []),
+                "srt_setsockflag": (c.c_int, [c.c_int, c.c_int, c.c_void_p, c.c_int]),
+                "srt_bind": (c.c_int, [c.c_int, c.c_void_p, c.c_int]), "srt_listen": (c.c_int, [c.c_int, c.c_int]),
+                "srt_accept": (c.c_int, [c.c_int, c.c_void_p, c.c_void_p]),
+                "srt_connect": (c.c_int, [c.c_int, c.c_void_p, c.c_int]),
+                "srt_sendmsg2": (c.c_int, [c.c_int, c.c_char_p, c.c_int, c.c_void_p]),
+                "srt_bstats": (c.c_int, [c.c_int, c.c_void_p, c.c_int]), "srt_close": (c.c_int, [c.c_int]),
+                "srt_getlasterror_str": (c.c_char_p, []), "srt_getversion": (c.c_uint32, []),
+                "srt_getsockstate": (c.c_int, [c.c_int])}
+        for name, (res, args) in sigs.items():
+            fn = getattr(lib, name)
+            fn.restype, fn.argtypes = res, args
+        lib.srt_startup()
+        self.lib = lib
+        types = {"q": c.c_int64, "Q": c.c_uint64, "i": c.c_int, "d": c.c_double}
+        fields = [(_SRT_STATS_FIELDS[i + 1], types[_SRT_STATS_FIELDS[i]]) for i in range(0, len(_SRT_STATS_FIELDS), 2)]
+        self.Stats = type("SrtStats", (c.Structure,), {"_fields_": fields + [("_reserved", c.c_ubyte * 1024)]})
+
+    def version(self):
+        v = self.lib.srt_getversion()
+        return f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
+
+    def error(self):
+        return (self.lib.srt_getlasterror_str() or b"").decode("utf-8", "replace")
+
+    def check(self, rc, what):
+        if rc < 0:
+            raise OSError(f"{what}: {self.error()}")
+        return rc
+
+    def set_int(self, sock, opt, value, what):
+        import ctypes
+        v = ctypes.c_int(int(value))
+        self.check(self.lib.srt_setsockflag(sock, opt, ctypes.byref(v), ctypes.sizeof(v)), what)
+
+    def set_str(self, sock, opt, text, what):
+        import ctypes
+        b = text.encode("utf-8")
+        self.check(self.lib.srt_setsockflag(sock, opt, ctypes.create_string_buffer(b), len(b)), what)
+
+    def stats(self, sock):
+        import ctypes
+        st = self.Stats()
+        self.check(self.lib.srt_bstats(sock, ctypes.byref(st), 0), "Reading SRT statistics")
+        return st
+
+
+def load_srt(path):
+    if not path:
+        raise OSError("the SRT library (libsrt) wasn't found")
+    if path not in _SRT_LIBS:
+        _SRT_LIBS[path] = SrtLib(path)
+    return _SRT_LIBS[path]
+
+
+def check_srt_lib(path):
+    try:
+        return load_srt(path).version()
+    except Exception:
+        return None
+
+
+def _sockaddr(host, port):
+    """Pack a sockaddr for libsrt from a host name or address."""
+    import ctypes
+    import struct
+    fam, _t, _p, _c, sa = socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM)[0]
+    if fam == socket.AF_INET:
+        head = struct.pack("BB", 16, fam) if SYSTEM == "Darwin" else struct.pack("=H", fam)
+        raw = head + struct.pack("!H", port) + socket.inet_pton(fam, sa[0]) + bytes(8)
+    else:
+        head = struct.pack("BB", 28, fam) if SYSTEM == "Darwin" else struct.pack("=H", fam)
+        raw = head + struct.pack("!H", port) + struct.pack("=I", 0) + socket.inet_pton(fam, sa[0]) + \
+            struct.pack("=I", sa[3] if len(sa) > 3 else 0)
+    return ctypes.create_string_buffer(raw, len(raw)), len(raw)
+
+
+class SrtSender(threading.Thread):
+    """Sends the MPEG-TS that FFmpeg writes to a local UDP port over SRT (libsrt), reporting
+    ('srt_log' | 'srt_connected' | 'srt_stats' | 'srt_closed', payload) through `report`.
+
+    pad_bps > 0 tops the stream up with MPEG-TS null packets to that total rate (link test).
+    """
+
+    def __init__(self, s, report, stats_interval=1.0):
         super().__init__(daemon=True)
-        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rx.bind(("127.0.0.1", in_port))
-        self.rx.setblocking(False)
-        self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.s, self.report, self.stats_interval = dict(s), report, stats_interval
+        self.lib = load_srt(s["srt_lib"])
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            self.tx.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         except OSError:
             pass
-        self.dest = ("127.0.0.1", out_port)
-        self.target_bps = 0.0
+        self.udp.bind(("127.0.0.1", 0))
+        self.udp_port = self.udp.getsockname()[1]
+        self.pad_bps = 0.0
         self.stopped = threading.Event()
-
-    def run(self):
-        budget, last = 0.0, time.monotonic()
-        try:
-            while not self.stopped.is_set():
-                now = time.monotonic()
-                budget = min(budget + self.target_bps * (now - last) / 8.0, self.target_bps / 8.0 * 0.05 + 1316)
-                last = now
-                while True:  # real stream first
-                    try:
-                        data = self.rx.recv(65536)
-                    except (BlockingIOError, InterruptedError):
-                        break
-                    self.tx.sendto(data, self.dest)
-                    budget -= len(data)
-                while budget >= 1316:  # then padding up to the target rate
-                    self.tx.sendto(TS_NULL_PACKETS, self.dest)
-                    budget -= 1316
-                time.sleep(0.001)
-        except OSError:
-            pass
-        finally:
-            self.rx.close()
-            self.tx.close()
+        self.sock = self.listen_sock = -1
 
     def stop(self):
         self.stopped.set()
+        for sk in (self.listen_sock, self.sock):
+            if sk >= 0:
+                self.lib.lib.srt_close(sk)  # also unblocks a pending connect/accept
+
+    def run(self):
+        reason = ""
+        try:
+            self._connect()
+            if not self.stopped.is_set():
+                self.report("srt_connected", f"SRT connected ({self.s['mode']})")
+                self._pump()
+        except Exception as e:
+            reason = str(e) or repr(e)
+        finally:
+            for sk in (self.sock, self.listen_sock):
+                if sk >= 0:
+                    self.lib.lib.srt_close(sk)
+            self.udp.close()
+            self.report("srt_closed", "" if self.stopped.is_set() else (reason or "the SRT connection closed"))
+
+    def _connect(self):
+        L, s = self.lib, self.s
+        mode, host, port = s["mode"], s["host"].strip(), int(s["port"])
+        sock = L.check(L.lib.srt_create_socket(), "Creating an SRT socket")
+        self.sock = sock
+        L.set_int(sock, SRTO_SENDER, 1, "SRTO_SENDER")
+        L.set_int(sock, SRTO_LATENCY, int(float(s["latency"])), "Setting the SRT latency")
+        L.set_int(sock, SRTO_CONNTIMEO, 5000, "SRTO_CONNTIMEO")
+        if s["passphrase"]:
+            L.set_str(sock, SRTO_PASSPHRASE, s["passphrase"], "Setting the passphrase")
+            L.set_int(sock, SRTO_PBKEYLEN, int(s["pbkeylen"]), "Setting the key length")
+        if s["streamid"].strip():
+            L.set_str(sock, SRTO_STREAMID, s["streamid"].strip(), "Setting the stream ID")
+        if mode == "caller":
+            addr, n = _sockaddr(host, port)
+            self.report("srt_log", f"Calling {host}:{port}…")
+            L.check(L.lib.srt_connect(sock, addr, n), "Connection setup failure")
+        elif mode == "listener":
+            addr, n = _sockaddr(host or "0.0.0.0", port)
+            L.check(L.lib.srt_bind(sock, addr, n), f"Can't listen on port {port}")
+            L.check(L.lib.srt_listen(sock, 1), "srt_listen")
+            self.listen_sock, self.sock = sock, -1
+            self.report("srt_log", f"Listening on port {port} for the receiver…")
+            self.sock = L.check(L.lib.srt_accept(sock, None, None), "Waiting for the receiver")
+            L.lib.srt_close(sock)
+            self.listen_sock = -1
+        else:  # rendezvous
+            L.set_int(sock, SRTO_RENDEZVOUS, 1, "SRTO_RENDEZVOUS")
+            local, n = _sockaddr("0.0.0.0", port)
+            L.check(L.lib.srt_bind(sock, local, n), f"Can't bind port {port}")
+            addr, n = _sockaddr(host, port)
+            self.report("srt_log", f"Rendezvous with {host}:{port}…")
+            L.check(L.lib.srt_connect(sock, addr, n), "Connection setup failure")
+
+    def _pump(self):
+        L, sock = self.lib, self.sock
+        send = L.lib.srt_sendmsg2
+        null = TS_NULL_PACKETS
+        self.udp.setblocking(False)  # drop whatever queued up while connecting, so it isn't sent as a burst
+        try:
+            while self.udp.recv(65536):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        last_stats = last_pad = time.monotonic()
+        prev_bytes, prev_t, budget = 0, last_stats, 0.0
+        while not self.stopped.is_set():
+            self.udp.settimeout(0.002 if self.pad_bps else 0.2)
+            try:
+                data = self.udp.recv(65536)
+            except (socket.timeout, BlockingIOError):
+                data = None
+            if data:
+                if send(sock, data, len(data), None) < 0:
+                    raise OSError(f"SRT connection broken: {L.error()}")
+                budget -= len(data)
+            if self.pad_bps:
+                now = time.monotonic()
+                budget = min(budget + self.pad_bps * (now - last_pad) / 8.0, self.pad_bps / 8.0 * 0.05 + 1316)
+                last_pad = now
+                while budget >= 1316:
+                    if send(sock, null, 1316, None) < 0:
+                        raise OSError(f"SRT connection broken: {L.error()}")
+                    budget -= 1316
+            else:
+                budget = 0.0
+            now = time.monotonic()
+            if now - last_stats >= self.stats_interval:
+                last_stats = now
+                if L.lib.srt_getsockstate(sock) >= SRTS_BROKEN:
+                    raise OSError("SRT connection broken (the receiver went away)")
+                st = L.stats(sock)
+                rate = (st.byteSentTotal - prev_bytes) * 8 / max(now - prev_t, 1e-3) / 1e6
+                prev_bytes, prev_t = st.byteSentTotal, now
+                self.report("srt_stats", {
+                    "link": {"rtt": st.msRTT, "bandwidth": st.mbpsBandwidth},
+                    "send": {"packets": st.pktSentTotal, "packetsLost": st.pktSndLossTotal,
+                             "packetsRetransmitted": st.pktRetransTotal, "packetsDropped": st.pktSndDropTotal,
+                             "msBuf": st.msSndBuf, "mbitRate": rate, "bytes": st.byteSentTotal}})
+
+
+TS_NULL_PACKETS = (b"\x47\x1f\xff\x10" + b"\xff" * 184) * 7  # 7 MPEG-TS null packets = 1316 bytes
 
 
 class LinkTest(threading.Thread):
@@ -1057,15 +1223,10 @@ class LinkTest(threading.Thread):
         self.steps = steps or LINK_TEST_STEPS
         self.step_seconds = step_seconds
         self.stopped = threading.Event()
-        self.procs = []
+        self.ffmpeg = self.sender = None
 
     def stop(self):
         self.stopped.set()
-
-    def _launch(self, cmd, **kw):
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, **kw)
-        self.procs.append(p)
-        return p
 
     def run(self):
         try:
@@ -1073,11 +1234,10 @@ class LinkTest(threading.Thread):
         except Exception as e:
             self.report("linktest_done", {"ok": False, "error": str(e) or repr(e)})
         finally:
-            for p in self.procs:
-                if p.poll() is None:
-                    p.terminate()
-            if getattr(self, "relay", None):
-                self.relay.stop()
+            if self.ffmpeg and self.ffmpeg.poll() is None:
+                self.ffmpeg.terminate()
+            if self.sender:
+                self.sender.stop()
 
     def _run(self):
         s = self.s
@@ -1085,48 +1245,23 @@ class LinkTest(threading.Thread):
             latency = float(s["latency"])
         except ValueError:
             latency = 200.0
-        in_port, out_port = free_local_port(socket.SOCK_DGRAM), free_local_port(socket.SOCK_DGRAM)
-        slt_cmd = build_slt_command(dict(s, vbitrate="400", abitrate="0"), out_port)
-        slt_cmd[1] = "-s:50"  # frequent reports for short test steps
-        slt = self._launch(slt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         events = queue.Queue()
-
-        def read_stats():
-            for raw in slt.stdout:
-                raw = raw.strip()
-                if raw.startswith(b"{"):
-                    try:
-                        events.put(("stats", time.monotonic(), json.loads(raw)))
-                    except ValueError:
-                        pass
-
-        def read_log():
-            for raw in slt.stderr:
-                line = raw.decode("utf-8", "replace").strip()
-                low = line.lower()
-                if "connected" in low and "dis" not in low:
-                    events.put(("connected", time.monotonic(), line))
-                elif line:
-                    events.put(("log", time.monotonic(), line))
-            events.put(("exit", time.monotonic(), slt.wait()))
-
-        threading.Thread(target=read_stats, daemon=True).start()
-        threading.Thread(target=read_log, daemon=True).start()
-        self.relay = PaddingRelay(in_port, out_port)
-        self.relay.target_bps = self.steps[0] * 1e6
-        self.relay.start()
+        self.sender = SrtSender(s, lambda kind, payload: events.put((kind, time.monotonic(), payload)),
+                                stats_interval=0.25)
+        self.sender.pad_bps = self.steps[0] * 1e6
+        self.sender.start()
         ff = s["ffmpeg"] or "ffmpeg"
-        self._launch([ff, "-hide_banner", "-loglevel", "error", "-re",
-                      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
-                      "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
-                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                      "-b:v", "300k", "-maxrate", "300k", "-bufsize", "300k", "-g", "60", "-pix_fmt", "yuv420p",
-                      "-c:a", "aac", "-b:a", "64k", "-f", "mpegts",
-                      f"udp://127.0.0.1:{in_port}?pkt_size=1316"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.ffmpeg = subprocess.Popen(
+            [ff, "-hide_banner", "-loglevel", "error", "-re",
+             "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+             "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+             "-b:v", "300k", "-maxrate", "300k", "-bufsize", "300k", "-g", "60", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "64k", "-f", "mpegts", f"udp://127.0.0.1:{self.sender.udp_port}?pkt_size=1316"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
 
         self.report("linktest_progress", {"text": "Connecting to the receiver…"})
-        deadline, last_log = time.monotonic() + 20, ""
+        deadline = time.monotonic() + 25
         while True:
             if self.stopped.is_set():
                 return self.report("linktest_done", {"ok": False, "error": "cancelled"})
@@ -1134,22 +1269,20 @@ class LinkTest(threading.Thread):
                 kind, _t, val = events.get(timeout=0.2)
             except queue.Empty:
                 if time.monotonic() > deadline:
-                    raise OSError("no receiver answered within 20 s. Start the receiver (or check host, "
+                    raise OSError("no receiver answered within 25 s. Start the receiver (or check host, "
                                   "port and passphrase) and try again")
                 continue
-            if kind == "connected":
+            if kind == "srt_connected":
                 break
-            if kind == "log":
-                last_log = val
-            if kind == "exit":
-                raise OSError(f"the SRT connection failed ({last_log or 'no details'})")
+            if kind == "srt_closed":
+                raise OSError(val or "the SRT connection failed")
 
-        results, rtts, prev = [], [], None
+        results, rtts = [], []
         for mbps in self.steps:
-            self.relay.target_bps = mbps * 1e6
+            self.sender.pad_bps = mbps * 1e6
             t_start = time.monotonic()
             first = last = None
-            max_buf = 0.0
+            max_buf, broken = 0.0, False
             self.report("linktest_progress", {"text": f"Testing {mbps} Mbps…", "step": mbps, "results": results})
             while time.monotonic() - t_start < self.step_seconds:
                 if self.stopped.is_set():
@@ -1158,34 +1291,34 @@ class LinkTest(threading.Thread):
                     kind, t, val = events.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                if kind == "exit":
-                    first = None
-                    results.append({"mbps": mbps, "ok": False, "why": "connection dropped"})
+                if kind == "srt_closed":
+                    broken = True
                     break
-                if kind != "stats" or t - t_start < 1.0:  # let each step settle for a second
+                if kind != "srt_stats" or t - t_start < 1.0:  # let each step settle for a second
                     continue
-                snd, link = val.get("send", {}), val.get("link", {})
-                sample = (t, int(snd.get("bytes", 0)), int(snd.get("packets", 0)), int(snd.get("packetsLost", 0)),
-                          int(snd.get("packetsRetransmitted", 0)), int(snd.get("packetsDropped", 0)))
+                snd = val["send"]
+                sample = (t, snd["bytes"], snd["packets"], snd["packetsLost"], snd["packetsRetransmitted"],
+                          snd["packetsDropped"])
                 first = first or sample
                 last = sample
-                max_buf = max(max_buf, float(snd.get("msBuf", 0)))
-                rtts.append(float(link.get("rtt", 0)))
+                max_buf = max(max_buf, float(snd["msBuf"]))
+                rtts.append(float(val["link"]["rtt"]))
+            if broken:
+                results.append({"mbps": mbps, "ok": False, "why": "connection dropped"})
+            elif not first or last is first:
+                results.append({"mbps": mbps, "ok": False, "why": "no statistics"})
             else:
-                if not first or last is first:
-                    results.append({"mbps": mbps, "ok": False, "why": "no statistics"})
-                else:
-                    dt = last[0] - first[0]
-                    achieved = (last[1] - first[1]) * 8 / max(dt, 0.001) / 1e6
-                    dpk = max(last[2] - first[2], 1)
-                    loss = 100.0 * (last[3] - first[3]) / dpk
-                    retx = 100.0 * (last[4] - first[4]) / dpk
-                    drops = last[5] - first[5]
-                    why = ("packets dropped" if drops else "packet loss" if loss > 3 else
-                           "send buffer filling" if max_buf > max(150.0, 0.5 * latency) else
-                           "couldn't reach the rate" if achieved < 0.85 * mbps else "")
-                    results.append({"mbps": mbps, "ok": not why, "why": why, "achieved": achieved,
-                                    "loss": loss, "retx": retx, "buf": max_buf})
+                dt = last[0] - first[0]
+                achieved = (last[1] - first[1]) * 8 / max(dt, 0.001) / 1e6
+                dpk = max(last[2] - first[2], 1)
+                loss = 100.0 * (last[3] - first[3]) / dpk
+                retx = 100.0 * (last[4] - first[4]) / dpk
+                drops = last[5] - first[5]
+                why = ("packets dropped" if drops else "packet loss" if loss > 3 else
+                       "send buffer filling" if max_buf > max(150.0, 0.5 * latency) else
+                       "couldn't reach the rate" if achieved < 0.85 * mbps else "")
+                results.append({"mbps": mbps, "ok": not why, "why": why, "achieved": achieved,
+                                "loss": loss, "retx": retx, "buf": max_buf})
             self.report("linktest_progress", {"text": f"{mbps} Mbps: " + ("OK" if results[-1]["ok"]
                                               else results[-1]["why"]), "results": results})
             if not results[-1]["ok"]:
@@ -1285,8 +1418,8 @@ def load_config():
         pass
     if not ffmpeg_exists(cfg["ffmpeg"]):
         cfg["ffmpeg"] = DEFAULTS["ffmpeg"]
-    if not ffmpeg_exists(cfg["slt"]):
-        cfg["slt"] = DEFAULTS["slt"]
+    if not ffmpeg_exists(cfg["srt_lib"]):
+        cfg["srt_lib"] = DEFAULTS["srt_lib"]
     return cfg
 
 
@@ -1718,8 +1851,8 @@ class App(tk.Tk):
         self._meter_acc = {}
         self.pump = None
         self.pump_reported = False
-        self.slt = None            # srt-live-transmit process when detailed SRT stats are on
-        self.slt_mode = False
+        self.sender = None         # SrtSender (libsrt) when detailed SRT statistics are on
+        self.srt_mode = False
         self.bw_points = collections.deque(maxlen=120)
         self.srt_prev = None
         self.enc_prev = None
@@ -1872,7 +2005,7 @@ class App(tk.Tk):
             tk.Label(target, textvariable=self.stat_vars[key + "_sub"], font=F.small, bg=C["card"],
                      fg=C["muted"]).pack(anchor="w")
 
-        # SRT link statistics (from srt-live-transmit)
+        # SRT link statistics (from libsrt)
         link = tk.Frame(main, bg=C["bg"])
         link.grid(row=3, column=0, sticky="ew", pady=(S(10), 0))
         link_cards = [("SRT LINK", "q"), ("ROUND-TRIP", "rtt"), ("PACKET LOSS", "loss"),
@@ -2127,9 +2260,9 @@ class App(tk.Tk):
         check.grid(row=0, column=2, padx=(S(6), 0))
         self.lockables += [ffe, browse, check]
         r = self._field(t, 0, "FFmpeg location", ffrow)
-        slte = ttk.Entry(t, textvariable=self.vars["slt"], font=F.base)
+        slte = ttk.Entry(t, textvariable=self.vars["srt_lib"], font=F.base)
         self.lockables.append(slte)
-        r = self._field(t, r, "srt-live-transmit location (for SRT statistics)", slte)
+        r = self._field(t, r, "SRT library (libsrt), for link statistics", slte)
         r = self._check(t, r, "reconnect", "Reconnect automatically if the stream drops")
         r = self._help(t, r, "Retries with a growing delay (2 s, 4 s, 8 s … up to 30 s) until you end the stream.")
 
@@ -2255,12 +2388,13 @@ class App(tk.Tk):
             text = self._commands_text(s, video, audio, mask=True) if video else "(pick a video source)"
         except (ValueError, KeyError) as e:
             text = f"(incomplete settings: {e})"
-        if s["slt"]:
-            self.slt_status.set("Uses srt-live-transmit to send the stream and report link health." if s["srt_stats"]
+        if s["srt_lib"]:
+            self.slt_status.set("SRT Streamer sends the stream with the SRT library and reads its link "
+                                "statistics." if s["srt_stats"]
                                 else "Off: FFmpeg sends SRT itself (bandwidth graph shows encoder output).")
         else:
-            self.slt_status.set("Needs srt-live-transmit (bundled with the Windows app; on Linux install "
-                                "'srt-tools'). Without it only encoder bandwidth is shown.")
+            self.slt_status.set("Needs the SRT library (bundled with the Windows app; on Linux install "
+                                "'libsrt1.5-openssl'). Without it only encoder bandwidth is shown.")
         self.cmd_text.configure(state="normal")
         self.cmd_text.delete("1.0", "end")
         self.cmd_text.insert("1.0", text)
@@ -2273,10 +2407,10 @@ class App(tk.Tk):
             self.restart_job = self.after(400, self._restart_preview)
 
     def _commands_text(self, s, video, audio, mask):
-        if use_slt(s):
+        if use_srt_stats(s):
             return (cmd_to_string(build_command(s, video, audio, mask_secrets=mask, udp_port="UDP_PORT")) +
-                    "\n\n# sends it over SRT and reports link statistics:\n" +
-                    cmd_to_string(build_slt_command(s, "UDP_PORT", mask_secrets=mask)))
+                    "\n\n# SRT Streamer then sends this over SRT itself (libsrt) to " +
+                    build_srt_url(s).split("?")[0] + " and reads the link statistics.")
         return cmd_to_string(build_command(s, video, audio, mask_secrets=mask))
 
     # ---------------------------------------------------- bandwidth analyzer
@@ -2288,8 +2422,8 @@ class App(tk.Tk):
         s = self.settings()
         if self.want_stream:
             return self._set_msg("End the stream before testing the link.", "warn")
-        if not s["slt"]:
-            return self.bw_progress.set("The SRT link test needs srt-live-transmit (see the SRT tab).")
+        if not check_srt_lib(s["srt_lib"]):
+            return self.bw_progress.set("The SRT link test needs the SRT library (see the SRT tab).")
         err = validate(s, {"type": "test"})
         if err:
             self.tabbar.select("srt")
@@ -2442,11 +2576,11 @@ class App(tk.Tk):
 
     def check_ffmpeg(self, show):
         ff = self.vars["ffmpeg"].get() or "ffmpeg"
-        slt = self.vars["slt"].get()
+        lib = self.vars["srt_lib"].get()
 
         def work():
             info = check_ffmpeg(ff)
-            info["slt"] = check_slt(slt)
+            info["srt_lib"] = check_srt_lib(lib)
             self.q.put(("ffcheck", (info, show)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2475,7 +2609,7 @@ class App(tk.Tk):
             return
         version = info["version"].replace("ffmpeg version ", "FFmpeg ")
         if info["srt"]:
-            extra = f"  ·  srt-live-transmit {info['slt']}" if info.get("slt") else ""
+            extra = f"  ·  libsrt {info['srt_lib']}" if info.get("srt_lib") else ""
             self.ff_status.set(f"✓  {version}  ·  SRT supported{extra}")
             self.ff_lbl.configure(fg=C["muted"])
         else:
@@ -2603,8 +2737,20 @@ class App(tk.Tk):
                 return False
             pump.port = free_local_port()
             audio = dict(audio, port=pump.port, **{k: pump.format[k] for k in ("fmt", "rate", "channels")})
-        slt_mode = kind == "stream" and use_slt(s)
-        udp_port = free_local_port(socket.SOCK_DGRAM) if slt_mode else None
+        gen = self.gen + 1
+        srt_mode = kind == "stream" and use_srt_stats(s)
+        sender, udp_port = None, None
+        if srt_mode:
+            try:
+                sender = SrtSender(s, lambda k, p, g=gen: self.q.put((k, (g, p))))
+            except Exception as e:
+                if pump:
+                    pump.stop()
+                self._set_msg(f"Couldn't load the SRT library: {e}. Turn off detailed statistics in the SRT tab.",
+                              "error")
+                self.pill.set("error")
+                return False
+            udp_port = sender.udp_port
         try:
             cmd = build_command(s, video, audio, stream=(kind == "stream"), preview=preview, udp_port=udp_port)
             shown = build_command(s, video, audio, mask_secrets=True, stream=(kind == "stream"), preview=preview,
@@ -2612,32 +2758,20 @@ class App(tk.Tk):
         except (ValueError, KeyError) as e:
             if pump:
                 pump.stop()
+            if sender:
+                sender.stop()
             self._set_msg(f"Check settings: {e}", "error")
             return False
-        gen = self.gen + 1
-        slt = None
-        if slt_mode:
-            slt_cmd = build_slt_command(s, udp_port)
-            self._write_log("▶ srt:  " + cmd_to_string(build_slt_command(s, udp_port, mask_secrets=True)), "cmd")
-            try:
-                slt = subprocess.Popen(slt_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-            except OSError as e:
-                if pump:
-                    pump.stop()
-                self._set_msg(f"Could not start srt-live-transmit: {e}. Turn off detailed statistics "
-                              "in the SRT tab or fix its location in Advanced.", "error")
-                self.pill.set("error")
-                return False
-            threading.Thread(target=self._slt_stats_reader, args=(slt, gen), daemon=True).start()
-            threading.Thread(target=self._slt_log_reader, args=(slt, gen), daemon=True).start()
+        if sender:
+            self._write_log(f"▶ srt:  libsrt sender → {build_srt_url(s).split('?')[0]} (mode {s['mode']})", "cmd")
+            sender.start()
         self._write_log(("▶ stream" if kind == "stream" else "▶ preview") + ":  " + cmd_to_string(shown), "cmd")
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, creationflags=NO_WINDOW)
         except OSError as e:
-            if slt:
-                slt.kill()
+            if sender:
+                sender.stop()
             if pump:
                 pump.stop()
             self._set_msg(f"Could not start FFmpeg: {e}. Check its location in Advanced.", "error")
@@ -2647,7 +2781,7 @@ class App(tk.Tk):
         if pump:
             pump.go.set()
         self.pump, self.pump_reported = pump, False
-        self.slt, self.slt_mode = slt, slt_mode
+        self.sender, self.srt_mode = sender, srt_mode
         self.srt_prev = self.enc_prev = self.rtt_range = None
         self.gen = gen
         self.proc, self.proc_kind = proc, kind
@@ -2658,22 +2792,6 @@ class App(tk.Tk):
         threading.Thread(target=self._stderr_reader, args=(proc, self.gen), daemon=True).start()
         threading.Thread(target=self._frame_reader, args=(proc, self.gen), daemon=True).start()
         return True
-
-    def _slt_stats_reader(self, proc, gen):
-        for raw in proc.stdout:
-            raw = raw.strip()
-            if raw.startswith(b"{"):
-                try:
-                    self.q.put(("srtstats", (gen, json.loads(raw))))
-                except ValueError:
-                    pass
-
-    def _slt_log_reader(self, proc, gen):
-        for raw in proc.stderr:
-            line = raw.decode("utf-8", "replace").strip()
-            if line:
-                self.q.put(("sltline", (gen, line)))
-        self.q.put(("sltexit", (gen, proc.wait())))
 
     def _stderr_reader(self, proc, gen):
         buf = b""
@@ -2726,7 +2844,7 @@ class App(tk.Tk):
             if self.proc_kind != "stream":
                 return
             self._encoder_rate(line)
-            if not self.live and not self.slt_mode:
+            if not self.live and not self.srt_mode:
                 self.live = True
                 self.started_at = time.time()
                 self.retry_count = 0
@@ -2769,18 +2887,21 @@ class App(tk.Tk):
         size = int(m.group(1)) * (1024 * 1024 if m.group(2) in ("MiB", "MB") else 1024)
         t = int(m.group(3)) * 3600 + int(m.group(4)) * 60 + float(m.group(5))
         prev, self.enc_prev = self.enc_prev, (size, t)
-        if self.slt_mode or not prev or t - prev[1] < 0.4:
+        if self.srt_mode or not prev or t - prev[1] < 0.4:
             return
         mbps = (size - prev[0]) * 8 / (t - prev[1]) / 1e6
         self._show_bandwidth(max(mbps, 0.0), f"encoder output · target {self._target_mbps():.1f} Mbps")
 
-    def _handle_slt_line(self, gen, line):
+    def _handle_srt_log(self, gen, line):
+        if gen == self.gen:
+            self.recent_lines.append(line)
+            self._write_log("srt: " + line, "err" if ERROR_RE.search(line) else None)
+
+    def _handle_srt_connected(self, gen, line):
         if gen != self.gen:
             return
-        self.recent_lines.append(line)
-        low = line.lower()
-        self._write_log("srt: " + line, "err" if ERROR_RE.search(line) or "disconnected" in low else None)
-        if "connected" in low and "dis" not in low and self.proc_kind == "stream" and not self.live:
+        self._write_log("srt: " + line, "app")
+        if self.proc_kind == "stream" and not self.live:
             self.live = True
             self.started_at = time.time()
             self.retry_count = 0
@@ -2789,14 +2910,15 @@ class App(tk.Tk):
             self._write_log("● Stream is live.", "app")
             self._draw_badge()
 
-    def _on_slt_exit(self, gen, rc):
-        if gen != self.gen or not self.proc or self.pending:
+    def _on_srt_closed(self, gen, reason):
+        if gen != self.gen or not self.proc or self.pending or not reason:
             return
-        self.recent_lines.append(f"srt-live-transmit stopped (code {rc}): the SRT connection ended or failed")
+        self.recent_lines.append(f"SRT error: {reason}")
+        self._write_log(f"srt: {reason}", "err")
         threading.Thread(target=graceful_stop, args=(self.proc,), daemon=True).start()
 
     def _handle_srt_stats(self, gen, d):
-        if gen != self.gen or not self.slt_mode:
+        if gen != self.gen or not self.srt_mode:
             return
         link, snd = d.get("link", {}), d.get("send", {})
         rtt, cap = float(link.get("rtt", 0)), float(link.get("bandwidth", 0))
@@ -2847,9 +2969,9 @@ class App(tk.Tk):
             self.stat_vars[k + "_sub"].set("")
             self.link_value_lbls[k].configure(fg=C["text"])
         s = self.settings()
-        if self.want_stream and not use_slt(s):
+        if self.want_stream and not use_srt_stats(s):
             self.stat_vars["q"].set("Off")
-            self.stat_vars["q_sub"].set("needs srt-live-transmit" if not s["slt"] else "off in SRT tab")
+            self.stat_vars["q_sub"].set("needs libsrt" if not s["srt_lib"] else "off in SRT tab")
         self.bw_points.clear()
         self.spark.set([], self._target_mbps())
 
@@ -2878,10 +3000,9 @@ class App(tk.Tk):
             return
         kind = self.proc_kind
         self.proc, self.proc_kind, self.live = None, None, False
-        if self.slt:
-            if self.slt.poll() is None:
-                self.slt.terminate()
-            self.slt = None
+        if self.sender:
+            self.sender.stop()
+            self.sender = None
         if self.pump:
             self.pump.stop()
             if self.pump.error:
@@ -2928,12 +3049,14 @@ class App(tk.Tk):
                     self._apply_devices(*payload)
                 elif kind == "ffcheck":
                     self._apply_ffcheck(*payload)
-                elif kind == "srtstats":
+                elif kind == "srt_stats":
                     self._handle_srt_stats(*payload)
-                elif kind == "sltline":
-                    self._handle_slt_line(*payload)
-                elif kind == "sltexit":
-                    self._on_slt_exit(*payload)
+                elif kind == "srt_log":
+                    self._handle_srt_log(*payload)
+                elif kind == "srt_connected":
+                    self._handle_srt_connected(*payload)
+                elif kind == "srt_closed":
+                    self._on_srt_closed(*payload)
                 elif kind in ("linktest_progress", "linktest_done", "nettest_progress", "nettest_done"):
                     self._on_bw_event(kind, payload)
         except queue.Empty:
@@ -2991,8 +3114,8 @@ class App(tk.Tk):
             self.pump.stop()
         if self.proc:
             graceful_stop(self.proc, timeout=3)
-        if self.slt and self.slt.poll() is None:
-            self.slt.terminate()
+        if self.sender:
+            self.sender.stop()
         self.destroy()
 
 
