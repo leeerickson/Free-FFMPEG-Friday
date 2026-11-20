@@ -6,7 +6,7 @@ A desktop app that captures a screen or camera plus an audio source with FFmpeg 
 
 ## Download (Windows)
 
-Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. It's a single `SRT Streamer.exe` with FFmpeg built in. Builds from any branch are also attached to its GitHub Actions run under **Artifacts**.
+Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. Unzip it and run `SRT Streamer.exe` from the `SRT Streamer` folder. FFmpeg and the SRT library are included. Builds from any branch are also attached to its GitHub Actions run under **Artifacts**.
 
 ## Features
 - **Live preview** of the source before and while you're live.
@@ -53,7 +53,7 @@ The app has an end-to-end self-test. It drives the real UI through device discov
 - **Windows:**
   - downloads FFmpeg (BtbN GPL build) and checks that it has SRT and ddagrab,
   - self-tests from source,
-  - builds the single-file exe with PyInstaller,
+  - builds the app folder (`SRT Streamer.exe` + `_internal`) with PyInstaller,
   - self-tests **the built exe**, including that it used its bundled FFmpeg,
   - uploads the zip and the test reports and screenshots.
 - **Release:** pushing a tag `srt-streamer-vX.Y` (matching `APP_VERSION`) publishes a GitHub release with the zip.

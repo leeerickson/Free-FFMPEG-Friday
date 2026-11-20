@@ -1,11 +1,18 @@
 SRT Streamer for Windows (x64)
 ==============================
 
-Double-click "SRT Streamer.exe". Nothing to install: FFmpeg (with SRT and GPU screen
-capture) is built in.
+Unzip the whole "SRT Streamer" folder anywhere (for example Documents or C:\Tools) and
+double-click "SRT Streamer.exe" inside it. Keep the "_internal" folder next to the exe: it holds
+Python, FFmpeg (with SRT and GPU screen capture) and the SRT library. Nothing to install.
 
-- First launch: Windows SmartScreen may warn because the exe isn't code-signed.
-  Click "More info" -> "Run anyway". Startup takes a few seconds while it unpacks.
+If Windows says it can't verify the app (it isn't code-signed yet):
+- Before unzipping: right-click the downloaded zip -> Properties -> tick "Unblock" -> OK.
+  That clears the "downloaded from the internet" mark for everything inside.
+- "Windows protected your PC": click "More info" -> "Run anyway".
+- Windows Security / Defender alert: Protection history -> the entry -> Actions -> Allow on device.
+- "Smart App Control blocked an app" (Windows 11) can't be overridden per app; it needs the
+  signed version.
+
 - To use a different FFmpeg, put ffmpeg.exe next to SRT Streamer.exe, or set it in
   the Advanced tab.
 - Computer sound: pick "Computer sound: <your speakers/headphones>" as the audio

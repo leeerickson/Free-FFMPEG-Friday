@@ -112,11 +112,13 @@ jobs:
           if (Test-Path out/source-ddagrab.json) { Get-Content out/source-ddagrab.json }
           exit $code
 
-      - name: Build single-file exe (FFmpeg bundled)
+      - name: Build the app folder (FFmpeg and libsrt bundled)
+        # A folder build (exe + _internal) rather than a self-extracting single file: antivirus
+        # tools flag it far less often, and it starts faster.
         run: |
           python -m pip install --upgrade pip
           python -m pip install "pyinstaller==6.11.1"
-          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+          python -m PyInstaller --noconfirm --clean --onedir --windowed `
             --name "SRT Streamer" `
             --icon assets/icon.ico `
             --version-file packaging/version_info.txt `
@@ -124,35 +126,34 @@ jobs:
             --add-binary "vendor/srt/*;srt" `
             --hidden-import selftest `
             srt_streamer.py
-          Get-Item "dist/SRT Streamer.exe" | Format-List Name, Length
+          Get-Item "dist/SRT Streamer/SRT Streamer.exe" | Format-List Name, Length
+          Get-ChildItem "dist/SRT Streamer/_internal" -Filter *.exe -Recurse | Format-Table Name, Length
 
       - name: Self-test the built exe (GDI capture)
         run: |
           $report = "$PWD\out\exe-gdigrab.json"
-          $p = Start-Process -FilePath "dist\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "gdigrab" -Wait -PassThru
+          $p = Start-Process -FilePath "dist\SRT Streamer\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "gdigrab" -Wait -PassThru
           Get-Content $report
           if ($p.ExitCode -ne 0) { throw "exe self-test failed (exit $($p.ExitCode))" }
           $ff = (Get-Content $report | ConvertFrom-Json).info.ffmpeg
-          if ($ff -notmatch '_MEI') { throw "exe did not use its bundled FFmpeg: $ff" }
+          if ($ff -notmatch '_internal') { throw "exe did not use its bundled FFmpeg: $ff" }
           $r = Get-Content $report | ConvertFrom-Json
-          if ($r.info.srt_lib -notmatch '_MEI') { throw "exe did not use its bundled libsrt: $($r.info.srt_lib)" }
+          if ($r.info.srt_lib -notmatch '_internal') { throw "exe did not use its bundled libsrt: $($r.info.srt_lib)" }
           if (-not $r.info.srt_stats_mode) { throw "exe streamed without SRT statistics" }
 
       - name: Self-test the built exe (GPU capture, ddagrab)
         continue-on-error: true
         run: |
           $report = "$PWD\out\exe-ddagrab.json"
-          $p = Start-Process -FilePath "dist\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "ddagrab" -Wait -PassThru
+          $p = Start-Process -FilePath "dist\SRT Streamer\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "ddagrab" -Wait -PassThru
           Get-Content $report
           if ($p.ExitCode -ne 0) { throw "exe ddagrab self-test failed (exit $($p.ExitCode))" }
 
       - name: Package
         run: |
-          New-Item -ItemType Directory -Force pkg | Out-Null
-          Copy-Item "dist/SRT Streamer.exe" pkg/
-          Copy-Item vendor/FFMPEG-LICENSE.txt pkg/
-          Copy-Item packaging/README-windows.txt pkg/README.txt
-          Compress-Archive -Path pkg/* -DestinationPath SRT-Streamer-Windows-x64.zip -Force
+          Copy-Item vendor/FFMPEG-LICENSE.txt "dist/SRT Streamer/"
+          Copy-Item packaging/README-windows.txt "dist/SRT Streamer/README.txt"
+          Compress-Archive -Path "dist/SRT Streamer" -DestinationPath SRT-Streamer-Windows-x64.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:
