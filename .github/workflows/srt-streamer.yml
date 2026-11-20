@@ -83,20 +83,53 @@ jobs:
           if (-not (& vendor/ffmpeg.exe -hide_banner -filters | Select-String -Pattern '\sddagrab\s')) { throw "FFmpeg build has no ddagrab" }
           "$PWD\vendor" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Install the SRT library (MSYS2)
-        uses: msys2/setup-msys2@v2
+      # Our own SRT library: one srt.dll built with MSVC, with OpenSSL linked in statically, so the
+      # only other DLLs it needs are Windows' own and Microsoft's (signed) Visual C++ runtime.
+      - name: Cache static OpenSSL (vcpkg)
+        uses: actions/cache@v4
         with:
-          msystem: UCRT64
-          update: false
-          install: mingw-w64-ucrt-x86_64-srt
+          path: C:\vcpkg\installed
+          key: vcpkg-openssl-x64-windows-static-md-v1
 
-      - name: Collect libsrt.dll and the DLLs it needs
-        shell: msys2 {0}
+      - name: Build static OpenSSL (vcpkg)
         run: |
-          mkdir -p vendor/srt
-          cp /ucrt64/bin/libsrt.dll vendor/srt/
-          ldd /ucrt64/bin/libsrt.dll | awk '/\/ucrt64\// {print $3}' | xargs -r -I{} cp {} vendor/srt/
-          ls -la vendor/srt
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib" -Filter *.lib | Format-Table Name, Length
+
+      - name: Build the SRT library (single srt.dll)
+        env:
+          SRT_VERSION: v1.5.4
+        run: |
+          git clone --depth 1 --branch $env:SRT_VERSION https://github.com/Haivision/srt.git srt-src
+          $ossl = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          cmake -S srt-src -B srt-build -G "Visual Studio 17 2022" -A x64 `
+            -DENABLE_SHARED=ON -DENABLE_STATIC=OFF -DENABLE_APPS=OFF -DENABLE_STDCXX_SYNC=ON `
+            -DENABLE_ENCRYPTION=ON -DUSE_ENCLIB=openssl `
+            -DOPENSSL_USE_STATIC_LIBS=ON "-DOPENSSL_ROOT_DIR=$ossl" `
+            "-DCMAKE_SHARED_LINKER_FLAGS=crypt32.lib user32.lib advapi32.lib ws2_32.lib"
+          if ($LASTEXITCODE) { throw "cmake configure failed" }
+          cmake --build srt-build --config Release
+          if ($LASTEXITCODE) { throw "SRT build failed" }
+          $dll = Get-ChildItem srt-build -Recurse -Filter srt.dll | Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (-not $dll) { throw "srt.dll not found" }
+          New-Item -ItemType Directory -Force vendor/srt | Out-Null
+          Copy-Item $dll.FullName vendor/srt/
+          # Microsoft's Visual C++ runtime (signed by Microsoft), next to srt.dll
+          foreach ($n in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            Copy-Item "C:\Windows\System32\$n" vendor/srt/
+          }
+
+      - name: Check srt.dll needs nothing unsigned
+        run: |
+          python -m pip install --quiet pefile
+          python -c "import pefile; pe = pefile.PE('vendor/srt/srt.dll'); print('\n'.join(i.dll.decode() for i in pe.DIRECTORY_ENTRY_IMPORT))" | Tee-Object -Variable imports
+          $system = '^(kernel32|user32|advapi32|ws2_32|crypt32|bcrypt|ntdll|secur32|iphlpapi|shell32|ole32|msvcp140|vcruntime140|vcruntime140_1|ucrtbase|api-ms-win-[a-z0-9-]+)\.dll$'
+          $other = $imports | Where-Object { $_.Trim() -and ($_.ToLower() -notmatch $system) }
+          if ($other) { throw "srt.dll needs other DLLs: $other" }
+          Get-ChildItem vendor/srt | ForEach-Object {
+            $s = Get-AuthenticodeSignature $_.FullName
+            "{0,-22} {1,10:N0} bytes  {2}  {3}" -f $_.Name, $_.Length, $s.Status, $(if ($s.SignerCertificate) { $s.SignerCertificate.Subject.Split(',')[0] } else { '' })
+          }
 
       - name: Self-test from source (GDI capture)
         run: |
@@ -194,8 +227,8 @@ jobs:
           Get-Content $report
           if ($p.ExitCode -ne 0) { throw "exe ddagrab self-test failed (exit $($p.ExitCode))" }
 
-      # The standard download (single exe) leaves out libsrt and its MSYS2 DLLs (unsigned third-party
-      # files that Smart App Control may refuse); the app then streams with FFmpeg's own SRT, without
+      # The standard download (single exe) leaves out the SRT library (an unsigned file that Smart App
+      # Control may refuse); the app then streams with FFmpeg's own SRT, without
       # link statistics or the SRT link test. The "with-srt-stats" folder download includes them.
       - name: Self-test the standard build (GDI capture)
         run: |
