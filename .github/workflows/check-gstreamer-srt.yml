@@ -1,0 +1,90 @@
+name: Check GStreamer's SRT DLL signatures
+
+# One-off investigation: does GStreamer's official Windows runtime ship a code-signed SRT library
+# (and signed dependencies) that SRT Streamer could bundle instead of MSYS2's unsigned DLLs?
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/check-gstreamer-srt.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Find the latest GStreamer MSVC runtime installer
+        id: find
+        run: |
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/"
+          $versions = (Invoke-WebRequest $base -UseBasicParsing).Links.href |
+            Where-Object { $_ -match '^1\.\d+\.\d+/$' } | ForEach-Object { $_.TrimEnd('/') } |
+            Sort-Object { [version]$_ }
+          $found = $null
+          foreach ($v in ($versions | Select-Object -Last 4 | Sort-Object { [version]$_ } -Descending)) {
+            $dir = "$base$v/msvc/"
+            try { $links = (Invoke-WebRequest $dir -UseBasicParsing).Links.href } catch { continue }
+            $f = $links | Where-Object { $_ -match "^gstreamer-1\.0-msvc-x86_64-$([regex]::Escape($v))\.(msi|exe)$" } |
+              Select-Object -First 1
+            if ($f) { $found = "$dir$f"; Write-Host "GStreamer $v -> $f"; break }
+          }
+          if (-not $found) { throw "No MSVC x86_64 runtime installer found" }
+          "url=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Download and unpack (no install)
+        run: |
+          $url = "${{ steps.find.outputs.url }}"
+          $file = Split-Path $url -Leaf
+          Invoke-WebRequest $url -OutFile $file
+          Get-AuthenticodeSignature $file | Format-List Status, @{n='Signer';e={$_.SignerCertificate.Subject}}
+          New-Item -ItemType Directory -Force C:\gst | Out-Null
+          if ($file -like '*.msi') {
+            Start-Process msiexec.exe -ArgumentList "/a", "`"$PWD\$file`"", "/qn", "TARGETDIR=C:\gst" -Wait
+          } else {
+            Start-Process ".\$file" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/DIR=C:\gst" -Wait
+          }
+          (Get-ChildItem C:\gst -Recurse -File).Count
+
+      - name: Inspect the SRT DLL, its dependencies and its exports
+        run: |
+          python -m pip install --quiet pefile
+          @'
+          import os, sys, glob, subprocess, json
+          import pefile
+          root = r"C:\gst"
+          dlls = {os.path.basename(p).lower(): p for p in glob.glob(root + r"\**\*.dll", recursive=True)}
+          srt = [p for n, p in dlls.items() if n.startswith(("srt", "libsrt")) and "gst" not in n]
+          print("SRT DLL candidates:", srt or "none")
+          def sig(path):
+              out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    f"$s = Get-AuthenticodeSignature '{path}'; $s.Status.ToString() + ' | ' + "
+                                    "$(if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '-' })"],
+                                   capture_output=True, text=True).stdout.strip()
+              return out
+          need = ["srt_startup", "srt_create_socket", "srt_setsockflag", "srt_connect", "srt_bind", "srt_listen",
+                  "srt_accept", "srt_sendmsg2", "srt_bstats", "srt_close", "srt_getversion", "srt_getsockstate",
+                  "srt_getlasterror_str"]
+          system = ("kernel32", "user32", "advapi32", "ws2_32", "iphlpapi", "bcrypt", "crypt32", "ntdll", "msvcrt",
+                    "vcruntime140", "vcruntime140_1", "msvcp140", "ucrtbase", "shell32", "ole32", "secur32", "api-ms-win")
+          for path in srt:
+              pe = pefile.PE(path)
+              exports = {e.name.decode() for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name} if hasattr(pe, "DIRECTORY_ENTRY_EXPORT") else set()
+              imports = [i.dll.decode() for i in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])]
+              print(f"\n== {path}\n   signature: {sig(path)}")
+              print("   missing exports:", [n for n in need if n not in exports] or "none")
+              print("   imports:")
+              for imp in imports:
+                  low = imp.lower()
+                  if low.startswith(system) or low.split(".")[0] in system:
+                      print(f"     {imp}  (Windows / VC++ runtime)")
+                  else:
+                      p = dlls.get(low)
+                      print(f"     {imp}  -> {sig(p) if p else 'not in package'}")
+          '@ | Set-Content inspect.py
+          python inspect.py
