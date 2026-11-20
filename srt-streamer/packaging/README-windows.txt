@@ -10,8 +10,9 @@ If Windows says it can't verify the app (it isn't code-signed yet):
   That clears the "downloaded from the internet" mark for everything inside.
 - "Windows protected your PC": click "More info" -> "Run anyway".
 - Windows Security / Defender alert: Protection history -> the entry -> Actions -> Allow on device.
-- "Smart App Control blocked an app" (Windows 11) can't be overridden per app; it needs the
-  signed version.
+- "Smart App Control blocked an app" (Windows 11) can't be overridden per app. Smart App
+  Control only allows signed apps, so this needs a signed build (or Smart App Control turned
+  off, which Windows can't undo without a reset).
 
 - To use a different FFmpeg, put ffmpeg.exe next to SRT Streamer.exe, or set it in
   the Advanced tab.

@@ -48,6 +48,8 @@ jobs:
     name: Windows build + self-test
     runs-on: windows-2022
     timeout-minutes: 30
+    env:
+      HAS_SIGNING_SECRETS: ${{ secrets.AZURE_CLIENT_ID != '' }}
     defaults:
       run:
         shell: pwsh
@@ -128,6 +130,34 @@ jobs:
             srt_streamer.py
           Get-Item "dist/SRT Streamer/SRT Streamer.exe" | Format-List Name, Length
           Get-ChildItem "dist/SRT Streamer/_internal" -Filter *.exe -Recurse | Format-Table Name, Length
+
+      # Code signing with Microsoft Trusted Signing, so Smart App Control and SmartScreen accept the
+      # app. Skipped until the repository has the AZURE_* secrets and TRUSTED_SIGNING_* variables
+      # (see srt-streamer/packaging/SIGNING.md). Signs every exe/dll/pyd that isn't already signed,
+      # including the bundled FFmpeg and libsrt, then verifies the signatures.
+      - name: Sign the app (Trusted Signing)
+        if: ${{ env.HAS_SIGNING_SECRETS == 'true' && vars.TRUSTED_SIGNING_ACCOUNT != '' }}
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          Install-Module -Name TrustedSigning -Force -Scope CurrentUser -Repository PSGallery
+          $unsigned = Get-ChildItem "dist/SRT Streamer" -Recurse -Include *.exe, *.dll, *.pyd |
+            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+          Write-Host "Signing $($unsigned.Count) file(s)"
+          $list = "$env:RUNNER_TEMP\to-sign.txt"
+          $unsigned.FullName | Set-Content -Path $list -Encoding utf8
+          Invoke-TrustedSigning `
+            -Endpoint "${{ vars.TRUSTED_SIGNING_ENDPOINT }}" `
+            -CodeSigningAccountName "${{ vars.TRUSTED_SIGNING_ACCOUNT }}" `
+            -CertificateProfileName "${{ vars.TRUSTED_SIGNING_PROFILE }}" `
+            -FilesCatalog $list `
+            -FileDigest SHA256 -TimestampRfc3161 "http://timestamp.acs.microsoft.com" -TimestampDigest SHA256
+          $bad = Get-ChildItem "dist/SRT Streamer" -Recurse -Include *.exe, *.dll, *.pyd |
+            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+          if ($bad) { $bad.FullName; throw "$($bad.Count) file(s) are still unsigned" }
+          Get-AuthenticodeSignature "dist/SRT Streamer/SRT Streamer.exe" | Format-List Status, SignerCertificate
 
       - name: Self-test the built exe (GDI capture)
         run: |

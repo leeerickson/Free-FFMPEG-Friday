@@ -60,5 +60,8 @@ The app has an end-to-end self-test. It drives the real UI through device discov
 
 GPU-capture (ddagrab) self-tests run on CI too, but they're allowed to fail: hosted runners have no GPU.
 
+## Code signing
+Windows Smart App Control blocks unsigned apps. The workflow signs the Windows build with Microsoft Trusted Signing once it's configured: see [`packaging/SIGNING.md`](packaging/SIGNING.md). Until then, builds are unsigned.
+
 ## License
 The app is GPL-2.0, like this repo. The Windows build bundles FFmpeg, which is GPL; see `FFMPEG-LICENSE.txt` in the zip.
