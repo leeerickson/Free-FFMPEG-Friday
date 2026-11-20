@@ -2422,8 +2422,13 @@ class App(tk.Tk):
         s = self.settings()
         if self.want_stream:
             return self._set_msg("End the stream before testing the link.", "warn")
+        if not s["srt_lib"]:
+            return self.bw_progress.set("The SRT link test needs the SRT library, which this download doesn't "
+                                        "include. Use the 'with-srt-stats' download, the Internet test, or type "
+                                        "a budget.")
         if not check_srt_lib(s["srt_lib"]):
-            return self.bw_progress.set("The SRT link test needs the SRT library (see the SRT tab).")
+            return self.bw_progress.set("Windows wouldn't load the SRT library (often Smart App Control blocking "
+                                        "unsigned files). Use the Internet test or type a budget.")
         err = validate(s, {"type": "test"})
         if err:
             self.tabbar.select("srt")
@@ -2580,7 +2585,7 @@ class App(tk.Tk):
 
         def work():
             info = check_ffmpeg(ff)
-            info["srt_lib"] = check_srt_lib(lib)
+            info["srt_lib"] = bool(lib) and (os.path.isfile(lib) or not os.path.isabs(lib))
             self.q.put(("ffcheck", (info, show)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2609,7 +2614,7 @@ class App(tk.Tk):
             return
         version = info["version"].replace("ffmpeg version ", "FFmpeg ")
         if info["srt"]:
-            extra = f"  ·  libsrt {info['srt_lib']}" if info.get("srt_lib") else ""
+            extra = "  ·  SRT stats library present" if info.get("srt_lib") else ""
             self.ff_status.set(f"✓  {version}  ·  SRT supported{extra}")
             self.ff_lbl.configure(fg=C["muted"])
         else:
@@ -2743,14 +2748,14 @@ class App(tk.Tk):
         if srt_mode:
             try:
                 sender = SrtSender(s, lambda k, p, g=gen: self.q.put((k, (g, p))))
+                udp_port = sender.udp_port
             except Exception as e:
-                if pump:
-                    pump.stop()
-                self._set_msg(f"Couldn't load the SRT library: {e}. Turn off detailed statistics in the SRT tab.",
-                              "error")
-                self.pill.set("error")
-                return False
-            udp_port = sender.udp_port
+                # e.g. Windows Smart App Control refusing an unsigned DLL: stream with FFmpeg's own SRT
+                srt_mode, sender = False, None
+                self._write_log(f"SRT library unavailable ({e}); FFmpeg sends SRT itself, without link "
+                                "statistics.", "err")
+                self._set_msg("Streaming without detailed SRT statistics (the SRT library couldn't be loaded).",
+                              "warn")
         try:
             cmd = build_command(s, video, audio, stream=(kind == "stream"), preview=preview, udp_port=udp_port)
             shown = build_command(s, video, audio, mask_secrets=True, stream=(kind == "stream"), preview=preview,

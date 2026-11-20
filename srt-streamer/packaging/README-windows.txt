@@ -5,6 +5,13 @@ Unzip the whole "SRT Streamer" folder anywhere (for example Documents or C:\Tool
 double-click "SRT Streamer.exe" inside it. Keep the "_internal" folder next to the exe: it holds
 Python, FFmpeg (with SRT and GPU screen capture) and the SRT library. Nothing to install.
 
+Two downloads:
+- SRT-Streamer-Windows-x64.zip: the standard app. Streams with FFmpeg's SRT; the bandwidth
+  graph shows encoder output.
+- SRT-Streamer-Windows-x64-with-srt-stats.zip: adds the SRT library (libsrt) for detailed
+  link statistics and the SRT link test. Until the app is code-signed, Windows Smart App
+  Control may block it; if the library can't load, the app falls back to the standard mode.
+
 If Windows says it can't verify the app (it isn't code-signed yet):
 - Before unzipping: right-click the downloaded zip -> Properties -> tick "Unblock" -> OK.
   That clears the "downloaded from the internet" mark for everything inside.

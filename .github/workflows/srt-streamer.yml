@@ -179,16 +179,42 @@ jobs:
           Get-Content $report
           if ($p.ExitCode -ne 0) { throw "exe ddagrab self-test failed (exit $($p.ExitCode))" }
 
+      # The standard download leaves out libsrt and its MSYS2 DLLs (unsigned third-party files that
+      # Smart App Control may refuse); the app then streams with FFmpeg's own SRT, without link
+      # statistics or the SRT link test. The "with-srt-stats" download includes them.
+      - name: Make the standard build (without the SRT stats library)
+        run: |
+          New-Item -ItemType Directory -Force dist-std | Out-Null
+          Copy-Item -Recurse "dist/SRT Streamer" "dist-std/SRT Streamer"
+          Remove-Item -Recurse -Force "dist-std/SRT Streamer/_internal/srt"
+
+      - name: Self-test the standard build (GDI capture)
+        run: |
+          $report = "$PWD\out\exe-standard-gdigrab.json"
+          $p = Start-Process -FilePath "dist-std\SRT Streamer\SRT Streamer.exe" -ArgumentList "--self-test", $report, "--capture", "gdigrab" -Wait -PassThru
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "standard build self-test failed (exit $($p.ExitCode))" }
+          $r = Get-Content $report | ConvertFrom-Json
+          if ($r.info.ffmpeg -notmatch '_internal') { throw "standard build did not use its bundled FFmpeg" }
+          if ($r.info.srt_stats_mode) { throw "standard build unexpectedly used the SRT library" }
+
       - name: Package
         run: |
-          Copy-Item vendor/FFMPEG-LICENSE.txt "dist/SRT Streamer/"
-          Copy-Item packaging/README-windows.txt "dist/SRT Streamer/README.txt"
-          Compress-Archive -Path "dist/SRT Streamer" -DestinationPath SRT-Streamer-Windows-x64.zip -Force
+          foreach ($d in "dist", "dist-std") {
+            Copy-Item vendor/FFMPEG-LICENSE.txt "$d/SRT Streamer/"
+            Copy-Item packaging/README-windows.txt "$d/SRT Streamer/README.txt"
+          }
+          Compress-Archive -Path "dist-std/SRT Streamer" -DestinationPath SRT-Streamer-Windows-x64.zip -Force
+          Compress-Archive -Path "dist/SRT Streamer" -DestinationPath SRT-Streamer-Windows-x64-with-srt-stats.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: SRT-Streamer-Windows-x64
           path: srt-streamer/SRT-Streamer-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SRT-Streamer-Windows-x64-with-srt-stats
+          path: srt-streamer/SRT-Streamer-Windows-x64-with-srt-stats.zip
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -214,11 +240,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: SRT-Streamer-Windows-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: SRT-Streamer-Windows-x64-with-srt-stats
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" SRT-Streamer-Windows-x64.zip \
+          gh release create "$GITHUB_REF_NAME" SRT-Streamer-Windows-x64.zip SRT-Streamer-Windows-x64-with-srt-stats.zip \
             --repo "$GITHUB_REPOSITORY" \
             --title "SRT Streamer ${GITHUB_REF_NAME#srt-streamer-v}" \
-            --notes "Windows x64 build with FFmpeg (SRT + GPU capture) bundled. Built and self-tested by GitHub Actions on Windows Server 2022."
+            --notes "Windows x64 builds with FFmpeg (SRT + GPU capture) bundled, built and self-tested by GitHub Actions on Windows Server 2022. SRT-Streamer-Windows-x64.zip is the standard download. The with-srt-stats download adds the SRT library for link statistics and the SRT link test; unsigned builds of it may be blocked by Windows Smart App Control."
