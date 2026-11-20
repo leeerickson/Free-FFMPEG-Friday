@@ -118,8 +118,13 @@ jobs:
         # A folder build (exe + _internal) rather than a self-extracting single file: antivirus
         # tools flag it far less often, and it starts faster.
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install "pyinstaller==6.11.1"
+          python -m pip install --upgrade pip wheel
+          # Compile PyInstaller's launcher (bootloader) here instead of using the prebuilt one that
+          # ships on PyPI: antivirus products often flag the prebuilt stub because malware reuses it.
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          python -m pip install --no-binary pyinstaller "pyinstaller==6.11.1"
+          $boot = python -c "import PyInstaller, os; print(os.path.join(os.path.dirname(PyInstaller.__file__), 'bootloader', 'Windows-64bit-intel', 'runw.exe'))"
+          Get-Item $boot | Format-List FullName, Length, LastWriteTime
           python -m PyInstaller --noconfirm --clean --onedir --windowed `
             --name "SRT Streamer" `
             --icon assets/icon.ico `
