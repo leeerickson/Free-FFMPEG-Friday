@@ -47,7 +47,7 @@ import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "SRT Streamer"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".srt_streamer.json")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if SYSTEM == "Windows" else 0
 
@@ -210,6 +210,352 @@ def dxgi_outputs():
     return outputs
 
 
+# ==========================================================================
+# Computer sound (Windows WASAPI loopback) and the PCM pump that feeds FFmpeg
+# ==========================================================================
+def _com(obj, index, *args, argtypes=()):
+    """Call method `index` of the COM vtable of interface pointer `obj`."""
+    import ctypes
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[index])
+    return fn(obj, *args)
+
+
+def _hr(hr, what):
+    if hr < 0:
+        raise OSError(f"{what} failed (HRESULT 0x{hr & 0xFFFFFFFF:08X})")
+
+
+def _guid(text):
+    import ctypes
+    import uuid
+    return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
+
+
+def _release(obj):
+    if obj:
+        _com(obj, 2)
+
+
+CLSID_MMDeviceEnumerator = "BCDE0395-E52F-467C-8E3D-C4579291692E"
+IID_IMMDeviceEnumerator = "A95664D2-9614-4F35-A746-DE8DB63617E6"
+IID_IAudioClient = "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2"
+IID_IAudioCaptureClient = "C8ADBD64-E71E-48A0-A4DE-185C395CD317"
+PKEY_Device_FriendlyName = ("A45C254E-DF1C-4EFD-8020-67D146A850E0", 14)
+E_RENDER, E_MULTIMEDIA, DEVICE_STATE_ACTIVE, CLSCTX_ALL = 0, 1, 1, 0x17
+AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_BUFFERFLAGS_SILENT = 0x00020000, 0x2
+
+
+def _wave_format_class():
+    import ctypes
+
+    class WAVEFORMATEXTENSIBLE(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = [("wFormatTag", ctypes.c_ushort), ("nChannels", ctypes.c_ushort),
+                    ("nSamplesPerSec", ctypes.c_uint32), ("nAvgBytesPerSec", ctypes.c_uint32),
+                    ("nBlockAlign", ctypes.c_ushort), ("wBitsPerSample", ctypes.c_ushort),
+                    ("cbSize", ctypes.c_ushort), ("wValidBitsPerSample", ctypes.c_ushort),
+                    ("dwChannelMask", ctypes.c_uint32), ("SubFormat", ctypes.c_ubyte * 16)]
+    return WAVEFORMATEXTENSIBLE
+
+
+def _describe_mix_format(pwfx):
+    """WAVEFORMATEX(TENSIBLE)* -> dict(fmt, rate, channels, block) usable as FFmpeg raw-audio input."""
+    import ctypes
+    wf = ctypes.cast(pwfx, ctypes.POINTER(_wave_format_class())).contents
+    tag, bits = wf.wFormatTag, wf.wBitsPerSample
+    sub = int.from_bytes(bytes(wf.SubFormat[:4]), "little") if tag == 0xFFFE and wf.cbSize >= 22 else None
+    is_float = tag == 3 or sub == 3
+    if is_float and bits == 32:
+        fmt = "f32le"
+    elif not is_float and bits in (16, 24, 32):
+        fmt = {16: "s16le", 24: "s24le", 32: "s32le"}[bits]
+    else:
+        raise OSError(f"unsupported Windows mix format (tag {tag:#x}, {bits} bits)")
+    return {"fmt": fmt, "rate": wf.nSamplesPerSec, "channels": wf.nChannels, "block": wf.nBlockAlign}
+
+
+def _co_init():
+    import ctypes
+    ctypes.windll.ole32.CoInitializeEx(None, 0)  # MTA; an existing apartment (S_FALSE / changed mode) is fine
+
+
+def _device_enumerator():
+    import ctypes
+    enum = ctypes.c_void_p()
+    _hr(ctypes.windll.ole32.CoCreateInstance(ctypes.byref(_guid(CLSID_MMDeviceEnumerator)), None, CLSCTX_ALL,
+                                             ctypes.byref(_guid(IID_IMMDeviceEnumerator)), ctypes.byref(enum)),
+        "Creating the audio device enumerator")
+    return enum
+
+
+def _device_id(device):
+    import ctypes
+    p = ctypes.c_void_p()
+    _hr(_com(device, 5, ctypes.byref(p), argtypes=(ctypes.c_void_p,)), "IMMDevice::GetId")
+    try:
+        return ctypes.wstring_at(p.value)
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(p)
+
+
+def _device_name(device):
+    import ctypes
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", ctypes.c_ubyte * 16), ("pid", ctypes.c_ulong)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                    ("r3", ctypes.c_ushort), ("ptr", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+    store = ctypes.c_void_p()
+    _hr(_com(device, 4, 0, ctypes.byref(store), argtypes=(ctypes.c_ulong, ctypes.c_void_p)),
+        "IMMDevice::OpenPropertyStore")
+    try:
+        key = PROPERTYKEY(_guid(PKEY_Device_FriendlyName[0]), PKEY_Device_FriendlyName[1])
+        pv = PROPVARIANT()
+        _hr(_com(store, 5, ctypes.byref(key), ctypes.byref(pv), argtypes=(ctypes.c_void_p, ctypes.c_void_p)),
+            "IPropertyStore::GetValue")
+        try:
+            return ctypes.wstring_at(pv.ptr) if pv.vt == 31 and pv.ptr else "Audio device"  # VT_LPWSTR
+        finally:
+            ctypes.windll.ole32.PropVariantClear(ctypes.byref(pv))
+    finally:
+        _release(store)
+
+
+def _audio_client(device):
+    import ctypes
+    client = ctypes.c_void_p()
+    _hr(_com(device, 3, ctypes.byref(_guid(IID_IAudioClient)), CLSCTX_ALL, None, ctypes.byref(client),
+             argtypes=(ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)),
+        "IMMDevice::Activate(IAudioClient)")
+    return client
+
+
+def _mix_format(client):
+    """Returns (WAVEFORMATEX* to CoTaskMemFree, description dict)."""
+    import ctypes
+    pwfx = ctypes.c_void_p()
+    _hr(_com(client, 8, ctypes.byref(pwfx), argtypes=(ctypes.c_void_p,)), "IAudioClient::GetMixFormat")
+    return pwfx, _describe_mix_format(pwfx)
+
+
+def wasapi_output_devices():
+    """Active speaker/headphone outputs: [{'id', 'name', 'default', 'fmt', 'rate', 'channels', 'block'}]."""
+    import ctypes
+    _co_init()
+    enum = _device_enumerator()
+    devices = []
+    try:
+        default_id = None
+        dev = ctypes.c_void_p()
+        if _com(enum, 4, E_RENDER, E_MULTIMEDIA, ctypes.byref(dev),
+                argtypes=(ctypes.c_int, ctypes.c_int, ctypes.c_void_p)) >= 0:
+            try:
+                default_id = _device_id(dev)
+            finally:
+                _release(dev)
+        coll = ctypes.c_void_p()
+        _hr(_com(enum, 3, E_RENDER, DEVICE_STATE_ACTIVE, ctypes.byref(coll),
+                 argtypes=(ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)), "EnumAudioEndpoints")
+        try:
+            count = ctypes.c_uint()
+            _hr(_com(coll, 3, ctypes.byref(count), argtypes=(ctypes.c_void_p,)), "IMMDeviceCollection::GetCount")
+            for i in range(count.value):
+                dev = ctypes.c_void_p()
+                if _com(coll, 4, i, ctypes.byref(dev), argtypes=(ctypes.c_uint, ctypes.c_void_p)) < 0:
+                    continue
+                try:
+                    info = {"id": _device_id(dev), "name": _device_name(dev)}
+                    client = _audio_client(dev)
+                    try:
+                        pwfx, desc = _mix_format(client)
+                        ctypes.windll.ole32.CoTaskMemFree(pwfx)
+                    finally:
+                        _release(client)
+                    info.update(desc, default=(info["id"] == default_id))
+                    devices.append(info)
+                except OSError:
+                    pass  # skip devices that can't be opened
+                finally:
+                    _release(dev)
+        finally:
+            _release(coll)
+    finally:
+        _release(enum)
+    devices.sort(key=lambda d: not d["default"])
+    return devices
+
+
+class WasapiLoopbackSource:
+    """Records what a Windows output device is playing (shared-mode WASAPI loopback)."""
+
+    def __init__(self, device_id):
+        self.device_id = device_id
+        self.enum = self.device = self.client = self.capture = None
+
+    def open(self):
+        import ctypes
+        _co_init()
+        self.enum = _device_enumerator()
+        self.device = ctypes.c_void_p()
+        _hr(_com(self.enum, 5, self.device_id, ctypes.byref(self.device),
+                 argtypes=(ctypes.c_wchar_p, ctypes.c_void_p)),
+            "Opening the audio output (it may have been unplugged)")
+        self.client = _audio_client(self.device)
+        pwfx, desc = _mix_format(self.client)
+        try:
+            _hr(_com(self.client, 3, 0, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, pwfx, None,
+                     argtypes=(ctypes.c_int, ctypes.c_uint32, ctypes.c_longlong, ctypes.c_longlong,
+                               ctypes.c_void_p, ctypes.c_void_p)),
+                "IAudioClient::Initialize(loopback)")
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(pwfx)
+        self.capture = ctypes.c_void_p()
+        _hr(_com(self.client, 14, ctypes.byref(_guid(IID_IAudioCaptureClient)), ctypes.byref(self.capture),
+                 argtypes=(ctypes.c_void_p, ctypes.c_void_p)), "IAudioClient::GetService(capture)")
+        self.block = desc["block"]
+        return desc
+
+    def start(self):
+        _hr(_com(self.client, 10), "IAudioClient::Start")
+
+    def read(self):
+        import ctypes
+        chunks = []
+        size = ctypes.c_uint32()
+        while True:
+            _hr(_com(self.capture, 5, ctypes.byref(size), argtypes=(ctypes.c_void_p,)), "GetNextPacketSize")
+            if size.value == 0:
+                return chunks
+            data, frames, flags = ctypes.c_void_p(), ctypes.c_uint32(), ctypes.c_uint32()
+            _hr(_com(self.capture, 3, ctypes.byref(data), ctypes.byref(frames), ctypes.byref(flags), None, None,
+                     argtypes=(ctypes.c_void_p,) * 5), "IAudioCaptureClient::GetBuffer")
+            n = frames.value * self.block
+            chunks.append(bytes(n) if flags.value & AUDCLNT_BUFFERFLAGS_SILENT or not data.value
+                          else ctypes.string_at(data.value, n))
+            _hr(_com(self.capture, 4, frames.value, argtypes=(ctypes.c_uint32,)), "ReleaseBuffer")
+
+    def close(self):
+        if self.client:
+            _com(self.client, 11)  # Stop
+        for obj in (self.capture, self.client, self.device, self.enum):
+            _release(obj)
+        self.enum = self.device = self.client = self.capture = None
+
+
+class ToneSource:
+    """Synthetic stereo test tone in real time, with gaps that exercise the pump's silence filling."""
+
+    def open(self):
+        self.rate, self.block = 48000, 8
+        return {"fmt": "f32le", "rate": self.rate, "channels": 2, "block": self.block}
+
+    def start(self):
+        self.t0, self.pos = time.monotonic(), 0
+
+    def read(self):
+        import array
+        import math
+        target = int((time.monotonic() - self.t0) * self.rate)
+        if target <= self.pos:
+            return []
+        start, self.pos = self.pos, target
+        if (start // (self.rate // 5)) % 6 == 5:  # 0.2 s of every 1.2 s: no data at all (idle device)
+            return []
+        buf = array.array("f")
+        for i in range(start, target):
+            t = i / self.rate
+            buf.append(0.5 * math.sin(2 * math.pi * 440 * t))
+            buf.append(0.3 * math.sin(2 * math.pi * 660 * t))
+        return [buf.tobytes()]
+
+    def close(self):
+        pass
+
+
+def free_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+class PcmPump(threading.Thread):
+    """Runs an audio source in its own thread and streams raw PCM to FFmpeg over local TCP.
+
+    FFmpeg listens (tcp://127.0.0.1:PORT?listen=1); the pump connects. When the source delivers
+    nothing (an idle Windows output sends no packets), silence is inserted so audio keeps time
+    with the video.
+    """
+
+    def __init__(self, source):
+        super().__init__(daemon=True)
+        self.source = source
+        self.format = None
+        self.port = None
+        self.error = None
+        self.ready = threading.Event()
+        self.go = threading.Event()
+        self.stopped = threading.Event()
+
+    def stop(self):
+        self.stopped.set()
+        self.go.set()
+
+    def run(self):
+        sock = None
+        try:
+            self.format = self.source.open()
+            self.ready.set()
+            self.go.wait()
+            if self.stopped.is_set():
+                return
+            deadline = time.monotonic() + 20
+            while not self.stopped.is_set():
+                try:
+                    sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise OSError("FFmpeg never opened the audio input")
+                    time.sleep(0.05)
+            if sock is None:
+                return
+            sock.settimeout(None)
+            block, rate = self.format["block"], self.format["rate"]
+            self.source.start()
+            t0 = last_data = time.monotonic()
+            frames = 0
+            while not self.stopped.is_set():
+                chunks = self.source.read()
+                now = time.monotonic()
+                if chunks:
+                    for c in chunks:
+                        sock.sendall(c)
+                        frames += len(c) // block
+                    last_data = now
+                elif now - last_data > 0.1:
+                    gap = int((now - t0) * rate) - frames
+                    if gap > 0:
+                        sock.sendall(bytes(gap * block))
+                        frames += gap
+                time.sleep(0.005)
+        except (ConnectionError, BrokenPipeError):
+            pass  # FFmpeg went away; normal on stop
+        except Exception as e:
+            self.error = str(e) or repr(e)
+        finally:
+            self.ready.set()
+            try:
+                self.source.close()
+            except Exception:
+                pass
+            if sock:
+                sock.close()
+
+
 def parse_dshow(text):
     video, audio, section = [], [], None
     for line in text.splitlines():
@@ -278,9 +624,16 @@ def enumerate_sources(ff):
         v, a = parse_dshow(run_quiet([ff, "-hide_banner", "-list_devices", "true",
                                       "-f", "dshow", "-i", "dummy"]))
         video += [{"label": f"Camera: {n}", "type": "dshow_video", "name": n} for n in v]
+        try:
+            for d in wasapi_output_devices():
+                audio.append({"label": f"Computer sound: {d['name']}" + ("  (default)" if d["default"] else ""),
+                              "type": "pcm_pump", "fmt": d["fmt"], "rate": d["rate"], "channels": d["channels"],
+                              "make_source": (lambda i=d["id"]: WasapiLoopbackSource(i))})
+        except Exception as e:
+            notes.append(f"Couldn't list speaker/headphone outputs for computer sound: {e}")
         audio += [{"label": n, "type": "dshow_audio", "name": n} for n in a]
-        notes.append("To send computer audio, enable 'Stereo Mix' in Sound settings or install "
-                     "a loopback device such as VB-CABLE, then pick it here.")
+        notes.append("'Computer sound' captures whatever plays through that speaker or headphone "
+                     "output. No Stereo Mix or virtual cable needed.")
 
     elif SYSTEM == "Darwin":
         v, a = parse_avfoundation(run_quiet([ff, "-hide_banner", "-f", "avfoundation",
@@ -384,6 +737,11 @@ def video_input_args(src, s):
 
 def audio_input_args(src):
     t = src["type"]
+    if t == "pcm_pump":  # raw PCM pushed by PcmPump over local TCP
+        port = src.get("port", "PORT")
+        return ["-f", src.get("fmt", "f32le"), "-ar", str(src.get("rate", 48000)),
+                "-ac", str(src.get("channels", 2)),
+                "-i", f"tcp://127.0.0.1:{port}?listen=1&listen_timeout=20000"]
     if t == "dshow_audio":
         return ["-f", "dshow", "-audio_buffer_size", "50", "-i", f"audio={src['name']}"]
     if t == "avf_audio":
@@ -937,6 +1295,8 @@ class App(tk.Tk):
         self._shown_frame = None
         self._photo = None
         self._meter_acc = {}
+        self.pump = None
+        self.pump_reported = False
         self._last_tick = time.time()
         self._last_blink = 0.0
         self.log_open = False
@@ -1581,10 +1941,24 @@ class App(tk.Tk):
             self._set_msg("Pick a video source first.", "error")
             return False
         preview = self._preview_size()
+        pump = None
+        if audio and audio.get("make_source"):
+            pump = PcmPump(audio["make_source"]())
+            pump.start()
+            if not pump.ready.wait(5) or pump.error or not pump.format:
+                pump.stop()
+                why = pump.error or "the audio device didn't respond"
+                self._set_msg(f"Couldn't open {audio['label']}: {why}", "error")
+                self._write_log(f"Audio capture failed: {why}", "err")
+                return False
+            pump.port = free_local_port()
+            audio = dict(audio, port=pump.port, **{k: pump.format[k] for k in ("fmt", "rate", "channels")})
         try:
             cmd = build_command(s, video, audio, stream=(kind == "stream"), preview=preview)
             shown = build_command(s, video, audio, mask_secrets=True, stream=(kind == "stream"), preview=preview)
         except (ValueError, KeyError) as e:
+            if pump:
+                pump.stop()
             self._set_msg(f"Check settings: {e}", "error")
             return False
         self._write_log(("▶ stream" if kind == "stream" else "▶ preview") + ":  " + cmd_to_string(shown), "cmd")
@@ -1592,10 +1966,15 @@ class App(tk.Tk):
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, creationflags=NO_WINDOW)
         except OSError as e:
+            if pump:
+                pump.stop()
             self._set_msg(f"Could not start FFmpeg: {e}. Check its location in Advanced.", "error")
             self._write_log(f"Could not start FFmpeg: {e}", "err")
             self.pill.set("error")
             return False
+        if pump:
+            pump.go.set()
+        self.pump, self.pump_reported = pump, False
         self.gen += 1
         self.proc, self.proc_kind = proc, kind
         self.live, self.started_at = False, None
@@ -1712,6 +2091,11 @@ class App(tk.Tk):
             return
         kind = self.proc_kind
         self.proc, self.proc_kind, self.live = None, None, False
+        if self.pump:
+            self.pump.stop()
+            if self.pump.error:
+                self.recent_lines.append(f"Computer sound capture error: {self.pump.error}")
+            self.pump = None
         if self.pending:
             cb, self.pending = self.pending, None
             cb()
@@ -1771,6 +2155,11 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+        if self.pump and self.pump.error and not self.pump_reported:
+            self.pump_reported = True
+            self._set_msg(f"Audio capture stopped: {self.pump.error}", "warn")
+            self._write_log(f"Audio capture error: {self.pump.error}", "err")
+
         acc, self._meter_acc = self._meter_acc, {}
         if acc and self.proc:
             left = acc.get(1, -90.0)
@@ -1797,6 +2186,8 @@ class App(tk.Tk):
         save_config(self.settings())
         self.want_stream = self.want_preview = False
         self._cancel_retry()
+        if self.pump:
+            self.pump.stop()
         if self.proc:
             graceful_stop(self.proc, timeout=3)
         self.destroy()

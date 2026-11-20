@@ -13,6 +13,7 @@ Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. It's a si
 - **Stereo peak meters** with peak hold.
 - **Stream health:** bitrate graph, frame rate and speed, dropped frames, uptime.
 - **Clear status** (Offline / Preview / Connecting / Live / Reconnecting) with automatic reconnect.
+- **Computer sound on Windows:** capture what any speaker or headphone output is playing (WASAPI loopback). No Stereo Mix or virtual cable needed.
 - **GPU screen capture** (ddagrab) on Windows, which handles monitors with different display scaling. GDI capture is kept as a fallback.
 - **Quality presets** and a choice of CPU or graphics-hardware encoders.
 - **SRT caller, listener and rendezvous** modes, AES encryption, stream ID.
@@ -28,7 +29,7 @@ Requires Python 3.8+ with Tkinter and an FFmpeg build with libsrt.
 
 | OS | Video | Audio |
 |---|---|---|
-| Windows | ddagrab (GPU) per monitor, gdigrab fallback, DirectShow cameras | DirectShow (mics, Stereo Mix, VB-CABLE) |
+| Windows | ddagrab (GPU) per monitor, gdigrab fallback, DirectShow cameras | Computer sound per output (WASAPI loopback), DirectShow mics |
 | macOS | avfoundation screens and cameras | avfoundation (mics, BlackHole for system audio) |
 | Linux | x11grab per monitor, v4l2 cameras | PulseAudio/PipeWire (`.monitor` = system audio), ALSA |
 

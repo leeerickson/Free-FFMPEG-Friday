@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -30,20 +31,16 @@ HARD_TIMEOUT = 120
 
 
 def _test_tone_patch():
-    """Add a synthetic stereo test-tone 'device' so the audio path and meters get exercised."""
-    orig_audio, orig_enum = m.audio_input_args, m.enumerate_sources
-
-    def audio_args(src):
-        if src["type"] == "selftest_tone":
-            return ["-re", "-f", "lavfi", "-i",
-                    "aevalsrc='0.5*sin(2*PI*440*t)|0.3*sin(2*PI*660*t)':s=48000"]
-        return orig_audio(src)
+    """Add a synthetic stereo tone 'device' that goes through the same PcmPump/TCP path as
+    Windows computer sound, so that path and the audio meters are exercised on every platform."""
+    orig_enum = m.enumerate_sources
 
     def enum(ff):
         video, audio, notes = orig_enum(ff)
-        return video, audio + [{"label": "Self-test tone", "type": "selftest_tone"}], notes
+        return video, audio + [{"label": "Self-test tone", "type": "pcm_pump", "fmt": "f32le",
+                                "rate": 48000, "channels": 2, "make_source": m.ToneSource}], notes
 
-    m.audio_input_args, m.enumerate_sources = audio_args, enum
+    m.enumerate_sources = enum
 
 
 def _probe(ff, path):
@@ -157,6 +154,24 @@ def main(argv):
         info["video_sources"] = list(app.video_map)
         info["ffmpeg"] = app.vars["ffmpeg"].get()
         if m.SYSTEM == "Windows":
+            try:
+                res = {}
+
+                def probe():  # COM apartment setup belongs off the Tk thread, as in the app
+                    try:
+                        res["outs"] = m.wasapi_output_devices()
+                    except Exception as e:
+                        res["err"] = e
+                t = threading.Thread(target=probe, daemon=True)
+                t.start()
+                t.join(15)
+                if "err" in res or "outs" not in res:
+                    raise res.get("err") or TimeoutError("listing outputs timed out")
+                outs = res["outs"]
+                info["wasapi_outputs"] = [(d["name"], d["fmt"], d["rate"], d["channels"]) for d in outs]
+                check("wasapi_enumeration", True, info["wasapi_outputs"])
+            except Exception as e:
+                check("wasapi_enumeration", False, repr(e))
             try:
                 info["dxgi_outputs"] = [(n, list(r)) for n, r, _h in m.dxgi_outputs()]
                 check("dxgi_enumeration", True, info["dxgi_outputs"])
