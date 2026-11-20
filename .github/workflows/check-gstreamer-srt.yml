@@ -88,3 +88,13 @@ jobs:
                       print(f"     {imp}  -> {sig(p) if p else 'not in package'}")
           '@ | Set-Content inspect.py
           python inspect.py
+
+      - name: Signatures of the SRT DLL and its OpenSSL dependency
+        run: |
+          foreach ($n in "srt.dll", "libcrypto-3-x64.dll", "gstreamer-1.0-0.dll") {
+            $p = Get-ChildItem C:\gst -Recurse -Filter $n | Select-Object -First 1
+            if (-not $p) { Write-Host "$n : not found"; continue }
+            $s = Get-AuthenticodeSignature $p.FullName
+            $signer = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { "-" }
+            Write-Host ("SIG {0} : {1} | {2}" -f $n, $s.Status, $signer)
+          }
