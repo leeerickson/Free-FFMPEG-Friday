@@ -49,7 +49,10 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     env:
-      HAS_SIGNING_SECRETS: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && vars.TRUSTED_SIGNING_ACCOUNT != '' }}
+      TS_ENDPOINT: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+      TS_ACCOUNT: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+      TS_PROFILE: ${{ vars.TRUSTED_SIGNING_PROFILE }}
     defaults:
       run:
         shell: pwsh
@@ -147,6 +150,18 @@ jobs:
           if (Test-Path out/source-ddagrab.json) { Get-Content out/source-ddagrab.json }
           exit $code
 
+      # Code signing with Microsoft Trusted Signing (Smart App Control and SmartScreen accept signed
+      # apps). Skipped until the AZURE_* secrets and TRUSTED_SIGNING_* variables exist (see
+      # packaging/SIGNING.md). The exes unpack FFmpeg and srt.dll at runtime and Windows checks those
+      # too, so they're signed before being packed in, and the finished exes after.
+      - name: Sign the bundled FFmpeg and srt.dll (Trusted Signing)
+        if: ${{ env.SIGNING_ENABLED == 'true' }}
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: ./packaging/sign.ps1 vendor
+
       - name: Build the apps (single exes; FFmpeg bundled, plus srt.dll in the stats build)
         # Single-file exes: on the user's PC antivirus accepted this form but flagged the folder layout.
         run: |
@@ -178,33 +193,13 @@ jobs:
             srt_streamer.py
           Get-Item "dist-stats/SRT Streamer.exe", "dist-onefile/SRT Streamer.exe" | Format-List FullName, Length
 
-      # Code signing with Microsoft Trusted Signing, so Smart App Control and SmartScreen accept the
-      # app. Skipped until the repository has the AZURE_* secrets and TRUSTED_SIGNING_* variables
-      # (see srt-streamer/packaging/SIGNING.md). Signs every exe/dll/pyd that isn't already signed,
-      # including the bundled FFmpeg and libsrt, then verifies the signatures.
-      - name: Sign the app (Trusted Signing)
-        if: ${{ env.HAS_SIGNING_SECRETS == 'true' && vars.TRUSTED_SIGNING_ACCOUNT != '' }}
+      - name: Sign the finished exes (Trusted Signing)
+        if: ${{ env.SIGNING_ENABLED == 'true' }}
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          Install-Module -Name TrustedSigning -Force -Scope CurrentUser -Repository PSGallery
-          $unsigned = Get-ChildItem "dist-stats", "dist-onefile" -Recurse -Include *.exe, *.dll, *.pyd |
-            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
-          Write-Host "Signing $($unsigned.Count) file(s)"
-          $list = "$env:RUNNER_TEMP\to-sign.txt"
-          $unsigned.FullName | Set-Content -Path $list -Encoding utf8
-          Invoke-TrustedSigning `
-            -Endpoint "${{ vars.TRUSTED_SIGNING_ENDPOINT }}" `
-            -CodeSigningAccountName "${{ vars.TRUSTED_SIGNING_ACCOUNT }}" `
-            -CertificateProfileName "${{ vars.TRUSTED_SIGNING_PROFILE }}" `
-            -FilesCatalog $list `
-            -FileDigest SHA256 -TimestampRfc3161 "http://timestamp.acs.microsoft.com" -TimestampDigest SHA256
-          $bad = Get-ChildItem "dist-stats", "dist-onefile" -Recurse -Include *.exe, *.dll, *.pyd |
-            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
-          if ($bad) { $bad.FullName; throw "$($bad.Count) file(s) are still unsigned" }
-          Get-AuthenticodeSignature "dist-stats/SRT Streamer.exe" | Format-List Status, SignerCertificate
+        run: ./packaging/sign.ps1 dist-stats dist-onefile
 
       - name: Self-test the built exe (GDI capture)
         run: |

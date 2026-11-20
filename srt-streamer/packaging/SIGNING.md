@@ -29,4 +29,4 @@ In the repository: **Settings** → **Secrets and variables** → **Actions**.
 | Variable | `TRUSTED_SIGNING_ACCOUNT` | the signing account name |
 | Variable | `TRUSTED_SIGNING_PROFILE` | the certificate profile name |
 
-The next build then signs the app, verifies every file's signature, and runs the self-test on the signed build. Release zips are signed from then on.
+The next build then signs in two stages: first the bundled `ffmpeg.exe` and `srt.dll` (the single-file exes unpack these when they start, and Windows checks them again then), then the finished `SRT Streamer.exe` files. It verifies every signature and self-tests the signed exes. Release zips are signed from then on. The signing commands live in `packaging/sign.ps1`.
