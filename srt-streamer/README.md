@@ -11,7 +11,9 @@ Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. It's a si
 ## Features
 - **Live preview** of the source before and while you're live.
 - **Stereo peak meters** with peak hold.
-- **Stream health:** bitrate graph, frame rate and speed, dropped frames, uptime.
+- **Stream health:** bandwidth graph (network send rate vs target, with loss markers), frame rate, dropped frames, uptime.
+- **SRT link statistics** via `srt-live-transmit`: link quality, round-trip time, packet loss, retransmitted and dropped packets, send buffer, estimated link capacity.
+- **USB devices:** webcams and capture cards (including their built-in audio) under Video source; microphones, headsets and USB audio interfaces under Audio source.
 - **Clear status** (Offline / Preview / Connecting / Live / Reconnecting) with automatic reconnect.
 - **Computer sound on Windows:** capture what any speaker or headphone output is playing (WASAPI loopback). No Stereo Mix or virtual cable needed.
 - **GPU screen capture** (ddagrab) on Windows, which handles monitors with different display scaling. GDI capture is kept as a fallback.
@@ -23,7 +25,7 @@ Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. It's a si
 Shortcut: Ctrl+Enter starts or ends the stream.
 
 ## Run from source
-Requires Python 3.8+ with Tkinter and an FFmpeg build with libsrt.
+Requires Python 3.8+ with Tkinter and an FFmpeg build with libsrt. For SRT link statistics also install `srt-live-transmit` (Debian/Ubuntu: `srt-tools`; it's bundled in the Windows exe).
 
     python srt_streamer.py
 

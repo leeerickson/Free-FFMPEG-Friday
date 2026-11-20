@@ -1,0 +1,2 @@
+Media path: 'udp://127.0.0.1:9301?rcvbuf=8388608' --> 'srt://127.0.0.1:9300?mode=caller&latency=200&passphrase=abcdefghij12&pbkeylen=16'
+SRT target connected

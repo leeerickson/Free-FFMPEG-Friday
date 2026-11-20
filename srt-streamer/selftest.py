@@ -63,6 +63,7 @@ def main(argv):
     if os.path.exists(m.CONFIG_PATH):  # always start from defaults, never a previous run's settings
         os.remove(m.CONFIG_PATH)
     m.DEFAULTS["ffmpeg"] = m.find_ffmpeg()
+    m.DEFAULTS["slt"] = m.find_slt()
     m.messagebox.askyesno = lambda *a, **k: True
     _test_tone_patch()
 
@@ -153,6 +154,7 @@ def main(argv):
         check("ffmpeg_with_srt", ok_ff, app.ff_status.get())
         info["video_sources"] = list(app.video_map)
         info["ffmpeg"] = app.vars["ffmpeg"].get()
+        info["slt"] = app.vars["slt"].get()
         if m.SYSTEM == "Windows":
             try:
                 res = {}
@@ -217,8 +219,21 @@ def main(argv):
                           fail("did not go live")))
 
     def step_live_ok():
-        check("went_live", True, f"bitrate={app.stat_vars['bitrate'].get()} fps={app.stat_vars['fps'].get()}")
-        app.after(3000, lambda: (screenshot("live"), app.after(500, step_end)))
+        check("went_live", True, f"fps={app.stat_vars['fps'].get()}")
+        info["srt_stats_mode"] = app.slt_mode
+        if app.slt_mode:  # detailed SRT statistics from srt-live-transmit
+            wait_for(lambda: app.stat_vars["q"].get() in ("Good", "Fair", "Poor")
+                     and app.stat_vars["rtt"].get() != "—" and app.stat_vars["bitrate"].get() != "—",
+                     12, lambda: step_stats(True), lambda: step_stats(False))
+        else:  # encoder bandwidth only
+            wait_for(lambda: app.stat_vars["bitrate"].get() != "—", 12,
+                     lambda: step_stats(True), lambda: step_stats(False))
+
+    def step_stats(ok):
+        sv = {k: v.get() for k, v in app.stat_vars.items()}
+        detail = {k: sv[k] for k in ("bitrate", "q", "q_sub", "rtt", "loss", "retx", "pdrop", "buf")}
+        check("srt_link_stats" if app.slt_mode else "bandwidth_stats", ok, detail)
+        app.after(2500, lambda: (screenshot("live"), app.after(500, step_end)))
 
     def step_end():
         app.toggle_live()

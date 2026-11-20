@@ -30,8 +30,8 @@ jobs:
         working-directory: srt-streamer
     steps:
       - uses: actions/checkout@v4
-      - name: Install FFmpeg, Tk and a virtual display
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg xvfb python3-tk
+      - name: Install FFmpeg, srt-live-transmit, Tk and a virtual display
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg srt-tools xvfb python3-tk
       - name: Self-test
         run: xvfb-run -a -s "-screen 0 1600x1000x24" /usr/bin/python3 srt_streamer.py --self-test out/linux-x11grab.json --capture x11grab
       - name: Show report
@@ -81,6 +81,25 @@ jobs:
           if (-not (& vendor/ffmpeg.exe -hide_banner -filters | Select-String -Pattern '\sddagrab\s')) { throw "FFmpeg build has no ddagrab" }
           "$PWD\vendor" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
+      - name: Install srt-live-transmit (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-srt
+
+      - name: Collect srt-live-transmit and its DLLs
+        shell: msys2 {0}
+        run: |
+          mkdir -p vendor/srt
+          cp /ucrt64/bin/srt-live-transmit.exe vendor/srt/
+          ldd /ucrt64/bin/srt-live-transmit.exe | awk '/\/ucrt64\// {print $3}' | xargs -r -I{} cp {} vendor/srt/
+          ls -la vendor/srt
+          vendor/srt/srt-live-transmit.exe -version
+
+      - name: Put srt-live-transmit on PATH (source tests)
+        run: '"$PWD\vendor\srt" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8'
+
       - name: Self-test from source (GDI capture)
         run: python srt_streamer.py --self-test out/source-gdigrab.json --capture gdigrab
 
@@ -98,6 +117,7 @@ jobs:
             --icon assets/icon.ico `
             --version-file packaging/version_info.txt `
             --add-binary "vendor/ffmpeg.exe;." `
+            --add-binary "vendor/srt/*;srt" `
             --hidden-import selftest `
             srt_streamer.py
           Get-Item "dist/SRT Streamer.exe" | Format-List Name, Length
@@ -110,6 +130,9 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "exe self-test failed (exit $($p.ExitCode))" }
           $ff = (Get-Content $report | ConvertFrom-Json).info.ffmpeg
           if ($ff -notmatch '_MEI') { throw "exe did not use its bundled FFmpeg: $ff" }
+          $r = Get-Content $report | ConvertFrom-Json
+          if ($r.info.slt -notmatch '_MEI') { throw "exe did not use its bundled srt-live-transmit: $($r.info.slt)" }
+          if (-not $r.info.srt_stats_mode) { throw "exe streamed without SRT statistics" }
 
       - name: Self-test the built exe (GPU capture, ddagrab)
         continue-on-error: true

@@ -47,7 +47,7 @@ import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "SRT Streamer"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".srt_streamer.json")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if SYSTEM == "Windows" else 0
 
@@ -103,6 +103,21 @@ def find_ffmpeg():
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
+def find_slt():
+    """srt-live-transmit, for detailed SRT link statistics: next to the app, bundled, or on PATH."""
+    exe = "srt-live-transmit.exe" if SYSTEM == "Windows" else "srt-live-transmit"
+    here = os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
+    bases = [here, os.path.dirname(here)]
+    if getattr(sys, "_MEIPASS", None):
+        bases.append(sys._MEIPASS)
+    for base in bases:
+        for sub in ("", "srt", "bin"):
+            cand = os.path.join(base, sub, exe)
+            if os.path.isfile(cand):
+                return cand
+    return shutil.which("srt-live-transmit") or ""
+
+
 def ffmpeg_exists(path):
     return bool(path) and (os.path.isfile(path) or shutil.which(path) is not None)
 
@@ -126,6 +141,8 @@ DEFAULTS = {
     "pbkeylen": "16",
     "streamid": "",
     "reconnect": True,
+    "srt_stats": True,
+    "slt": find_slt(),
 }
 
 
@@ -242,7 +259,7 @@ IID_IMMDeviceEnumerator = "A95664D2-9614-4F35-A746-DE8DB63617E6"
 IID_IAudioClient = "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2"
 IID_IAudioCaptureClient = "C8ADBD64-E71E-48A0-A4DE-185C395CD317"
 PKEY_Device_FriendlyName = ("A45C254E-DF1C-4EFD-8020-67D146A850E0", 14)
-E_RENDER, E_MULTIMEDIA, DEVICE_STATE_ACTIVE, CLSCTX_ALL = 0, 1, 1, 0x17
+E_RENDER, E_CAPTURE, E_MULTIMEDIA, DEVICE_STATE_ACTIVE, CLSCTX_ALL = 0, 1, 1, 1, 0x17
 AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_BUFFERFLAGS_SILENT = 0x00020000, 0x2
 
 
@@ -343,7 +360,17 @@ def _mix_format(client):
 
 
 def wasapi_output_devices():
-    """Active speaker/headphone outputs: [{'id', 'name', 'default', 'fmt', 'rate', 'channels', 'block'}]."""
+    """Active speaker/headphone outputs (for computer sound)."""
+    return wasapi_devices(E_RENDER)
+
+
+def wasapi_input_devices():
+    """Active recording inputs: microphones, USB audio interfaces, capture-card audio, etc."""
+    return wasapi_devices(E_CAPTURE)
+
+
+def wasapi_devices(flow):
+    """Active endpoints for a data flow: [{'id', 'name', 'default', 'fmt', 'rate', 'channels', 'block'}]."""
     import ctypes
     _co_init()
     enum = _device_enumerator()
@@ -351,14 +378,14 @@ def wasapi_output_devices():
     try:
         default_id = None
         dev = ctypes.c_void_p()
-        if _com(enum, 4, E_RENDER, E_MULTIMEDIA, ctypes.byref(dev),
+        if _com(enum, 4, flow, E_MULTIMEDIA, ctypes.byref(dev),
                 argtypes=(ctypes.c_int, ctypes.c_int, ctypes.c_void_p)) >= 0:
             try:
                 default_id = _device_id(dev)
             finally:
                 _release(dev)
         coll = ctypes.c_void_p()
-        _hr(_com(enum, 3, E_RENDER, DEVICE_STATE_ACTIVE, ctypes.byref(coll),
+        _hr(_com(enum, 3, flow, DEVICE_STATE_ACTIVE, ctypes.byref(coll),
                  argtypes=(ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)), "EnumAudioEndpoints")
         try:
             count = ctypes.c_uint()
@@ -389,11 +416,13 @@ def wasapi_output_devices():
     return devices
 
 
-class WasapiLoopbackSource:
-    """Records what a Windows output device is playing (shared-mode WASAPI loopback)."""
+class WasapiSource:
+    """Shared-mode WASAPI capture: loopback=True records what an output plays (computer sound),
+    loopback=False records an input device (microphone, USB audio interface, capture card)."""
 
-    def __init__(self, device_id):
+    def __init__(self, device_id, loopback=True):
         self.device_id = device_id
+        self.loopback = loopback
         self.enum = self.device = self.client = self.capture = None
 
     def open(self):
@@ -407,10 +436,10 @@ class WasapiLoopbackSource:
         self.client = _audio_client(self.device)
         pwfx, desc = _mix_format(self.client)
         try:
-            _hr(_com(self.client, 3, 0, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, pwfx, None,
+            _hr(_com(self.client, 3, 0, AUDCLNT_STREAMFLAGS_LOOPBACK if self.loopback else 0, 10_000_000, 0, pwfx, None,
                      argtypes=(ctypes.c_int, ctypes.c_uint32, ctypes.c_longlong, ctypes.c_longlong,
                                ctypes.c_void_p, ctypes.c_void_p)),
-                "IAudioClient::Initialize(loopback)")
+                "IAudioClient::Initialize")
         finally:
             ctypes.windll.ole32.CoTaskMemFree(pwfx)
         self.capture = ctypes.c_void_p()
@@ -446,6 +475,9 @@ class WasapiLoopbackSource:
         self.enum = self.device = self.client = self.capture = None
 
 
+WasapiLoopbackSource = WasapiSource
+
+
 class ToneSource:
     """Synthetic stereo test tone in real time, with gaps that exercise the pump's silence filling."""
 
@@ -476,8 +508,8 @@ class ToneSource:
         pass
 
 
-def free_local_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+def free_local_port(kind=socket.SOCK_STREAM):
+    with socket.socket(socket.AF_INET, kind) as sk:
         sk.bind(("127.0.0.1", 0))
         return sk.getsockname()[1]
 
@@ -567,13 +599,15 @@ def parse_dshow(text):
             continue
         if "dshow" not in line or "Alternative name" in line:
             continue
-        m = re.search(r'"([^"]+)"\s*(?:\((video|audio|none)\))?', line)
+        m = re.search(r'"([^"]+)"\s*(?:\(([^)]*)\))?', line)
         if not m:
             continue
-        kind = m.group(2) or section
-        if kind == "video":
+        # Newer FFmpeg tags each device "(video)", "(audio)" or "(audio, video)" (USB capture
+        # cards); older builds group devices under section headers instead.
+        kinds = {k.strip() for k in m.group(2).split(",")} if m.group(2) else {section}
+        if "video" in kinds and m.group(1) not in video:
             video.append(m.group(1))
-        elif kind == "audio":
+        if "audio" in kinds and m.group(1) not in audio:
             audio.append(m.group(1))
     return video, audio
 
@@ -593,9 +627,13 @@ def parse_avfoundation(text):
     return video, audio
 
 
+SCAN_LOG = []  # human-readable summary of the last device scan (shown in the app's log)
+
+
 def enumerate_sources(ff):
     """Return (video_sources, audio_sources, notes). Each source is a dict with a 'label'."""
     video, audio, notes = [], [], []
+    SCAN_LOG.clear()
 
     if SYSTEM == "Windows":
         filters = run_quiet([ff, "-hide_banner", "-filters"])
@@ -621,19 +659,35 @@ def enumerate_sources(ff):
         if not has_dda:
             notes.append("This FFmpeg has no ddagrab (GPU screen capture, FFmpeg 6.0+). GDI capture "
                          "can fail when monitors use different display scaling. Updating FFmpeg is recommended.")
-        v, a = parse_dshow(run_quiet([ff, "-hide_banner", "-list_devices", "true",
-                                      "-f", "dshow", "-i", "dummy"]))
-        video += [{"label": f"Camera: {n}", "type": "dshow_video", "name": n} for n in v]
-        try:
-            for d in wasapi_output_devices():
-                audio.append({"label": f"Computer sound: {d['name']}" + ("  (default)" if d["default"] else ""),
+        listing = run_quiet([ff, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                            timeout=25)
+        v, a = parse_dshow(listing)
+        video += [{"label": f"Video device: {n}" + ("  (with audio)" if n in a else ""),
+                   "type": "dshow_video", "name": n} for n in v]
+        SCAN_LOG.append(f"DirectShow: {len(v)} video device(s) {v}, {len(a)} audio device(s) {a}")
+        if not v and not a:
+            tail = [ln for ln in listing.splitlines() if ln.strip()][-6:]
+            SCAN_LOG.append("DirectShow listing output: " + (" | ".join(tail) or "(nothing)"))
+        names = set()
+        for flow, label, loopback in (("out", "Computer sound", True), ("in", "Input", False)):
+            try:
+                devs = wasapi_output_devices() if flow == "out" else wasapi_input_devices()
+            except Exception as e:
+                notes.append(f"Couldn't list Windows audio {flow}puts: {e}")
+                SCAN_LOG.append(f"Windows audio {flow}puts: error {e}")
+                continue
+            SCAN_LOG.append(f"Windows audio {flow}puts: {[d['name'] for d in devs]}")
+            for d in devs:
+                names.add(d["name"].lower())
+                audio.append({"label": f"{label}: {d['name']}" + ("  (default)" if d["default"] else ""),
                               "type": "pcm_pump", "fmt": d["fmt"], "rate": d["rate"], "channels": d["channels"],
-                              "make_source": (lambda i=d["id"]: WasapiLoopbackSource(i))})
-        except Exception as e:
-            notes.append(f"Couldn't list speaker/headphone outputs for computer sound: {e}")
-        audio += [{"label": n, "type": "dshow_audio", "name": n} for n in a]
+                              "make_source": (lambda i=d["id"], lb=loopback: WasapiSource(i, loopback=lb))})
+        # DirectShow-only audio (not already listed as a Windows input), e.g. some capture cards
+        audio += [{"label": f"Device audio: {n}", "type": "dshow_audio", "name": n}
+                  for n in a if n.lower() not in names]
         notes.append("'Computer sound' captures whatever plays through that speaker or headphone "
-                     "output. No Stereo Mix or virtual cable needed.")
+                     "output. 'Input' lists microphones, USB audio interfaces and capture-card audio. "
+                     "USB video devices (webcams, capture cards) appear under Video source.")
 
     elif SYSTEM == "Darwin":
         v, a = parse_avfoundation(run_quiet([ff, "-hide_banner", "-f", "avfoundation",
@@ -662,13 +716,16 @@ def enumerate_sources(ff):
         video.append({"label": f"Entire display {display}", "type": "x11grab", "display": display})
         for dev in sorted(os.listdir("/dev")) if os.path.isdir("/dev") else []:
             if re.fullmatch(r"video\d+", dev):
-                name = dev
+                name, sysdir = dev, f"/sys/class/video4linux/{dev}"
                 try:
-                    with open(f"/sys/class/video4linux/{dev}/name") as f:
+                    with open(f"{sysdir}/name") as f:
                         name = f.read().strip()
+                    with open(f"{sysdir}/index") as f:
+                        if f.read().strip() != "0":
+                            continue  # extra nodes (e.g. UVC metadata) can't capture video
                 except OSError:
                     pass
-                video.append({"label": f"Camera: {name} (/dev/{dev})", "type": "v4l2",
+                video.append({"label": f"Video device: {name} (/dev/{dev})", "type": "v4l2",
                               "device": f"/dev/{dev}"})
         if shutil.which("pactl"):
             for line in run_quiet(["pactl", "list", "short", "sources"]).splitlines():
@@ -687,7 +744,15 @@ def enumerate_sources(ff):
                 if m:
                     audio.append({"label": f"{m[2]} (hw:{m[1]},{m[3]})", "type": "alsa",
                                   "name": f"hw:{m[1]},{m[3]}"})
+    SCAN_LOG.append(f"Found {len(video)} video and {len(audio)} audio source(s).")
     return video, audio, notes
+
+
+def check_slt(path):
+    if not path:
+        return None
+    m = re.search(r"SRT Library version:\s*([\w.]+)", run_quiet([path, "-version"]))
+    return m.group(1) if m else None
 
 
 def check_ffmpeg(ff):
@@ -771,28 +836,65 @@ def preview_output_args(size, fps=6):
             "-c:v", "ppm", "-f", "image2pipe", "pipe:1"]
 
 
-def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None):
+def use_slt(s):
+    return bool(s.get("srt_stats") and s.get("slt"))
+
+
+def slt_report_every(s):
+    """srt-live-transmit reports stats every N packets; aim for about one report per second."""
+    try:
+        kbps = float(s["vbitrate"]) + float(s["abitrate"])
+    except (KeyError, ValueError):
+        kbps = 4000
+    return max(20, int(kbps * 1000 / 8 / 1316))
+
+
+def build_slt_command(s, udp_port, mask_secrets=False):
+    """srt-live-transmit: takes FFmpeg's MPEG-TS over local UDP and sends it over SRT,
+    printing JSON link statistics (RTT, loss, retransmits, buffer, bandwidth) on stdout."""
+    mode, host, port = s["mode"], s["host"].strip(), int(s["port"])
+    target = f"srt://{format_host(host) if host else ''}:{port}"
+    params = [f"mode={mode}", f"latency={int(float(s['latency']))}"]  # milliseconds here
+    if s["passphrase"]:
+        params += [f"passphrase={'********' if mask_secrets else s['passphrase']}", f"pbkeylen={s['pbkeylen']}"]
+    if s["streamid"].strip():
+        params.append(f"streamid={s['streamid'].strip()}")
+    return [s["slt"] or "srt-live-transmit", f"-s:{slt_report_every(s)}", "-pf:json", "-f", "-a:no",
+            f"udp://127.0.0.1:{udp_port}?rcvbuf=8388608", target + "?" + "&".join(params)]
+
+
+def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None, udp_port=None):
     """Build the FFmpeg argument list.
 
     stream=True   -> encode and send to SRT (plus an optional preview output)
     stream=False  -> preview only (frames to stdout, audio levels to the log)
     preview=(w,h) -> add a low-rate raw-frame output on stdout for the confidence monitor
+    udp_port      -> hand MPEG-TS to srt-live-transmit on this local UDP port instead of
+                     using FFmpeg's own SRT output
     """
     enc = s["encoder"].split()[0]
     fps = int(float(s["fps"]))
     vb = int(float(s["vbitrate"]))
     cmd = [s["ffmpeg"] or "ffmpeg", "-hide_banner", "-loglevel", "info", "-stats"]
-    cmd += ["-thread_queue_size", "1024"] + video_input_args(video, s)
-    if audio:
-        cmd += ["-thread_queue_size", "1024"] + audio_input_args(audio)
+    combined = bool(audio and video["type"] == "dshow_video" and audio["type"] == "dshow_audio"
+                    and audio["name"] == video["name"])
+    if combined:  # a USB capture card's own audio: open video and audio as one DirectShow device
+        cmd += ["-thread_queue_size", "1024", "-f", "dshow", "-rtbufsize", "256M",
+                "-i", f"video={video['name']}:audio={audio['name']}"]
+        amap = "0:a:0"
+    else:
+        cmd += ["-thread_queue_size", "1024"] + video_input_args(video, s)
+        if audio:
+            cmd += ["-thread_queue_size", "1024"] + audio_input_args(audio)
+        amap = "1:a:0"
 
     if not stream:
         cmd += preview_output_args(preview or (640, 360))
         if audio:
-            cmd += ["-map", "1:a:0", "-af", METER_FILTER, "-f", "null", "-"]
+            cmd += ["-map", amap, "-af", METER_FILTER, "-f", "null", "-"]
         return cmd
 
-    cmd += ["-map", "0:v:0"] + (["-map", "1:a:0"] if audio else [])
+    cmd += ["-map", "0:v:0"] + (["-map", amap] if audio else [])
     height = SCALES.get(s["scale"])
     vf = [f"scale=-2:{height}" if height else "scale=trunc(iw/2)*2:trunc(ih/2)*2",
           "format=nv12" if enc == "h264_qsv" else "format=yuv420p"]
@@ -804,12 +906,15 @@ def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None
         af = "aresample=async=1000" + ("," + METER_FILTER if preview else "")
         cmd += ["-c:a", "aac", "-b:a", f"{s['abitrate']}k", "-ar", "48000", "-ac", "2", "-af", af]
     cmd += ["-f", "mpegts"]
-    if s["passphrase"]:
-        cmd += ["-passphrase", "********" if mask_secrets else s["passphrase"],
-                "-pbkeylen", str(s["pbkeylen"])]
-    if s["streamid"].strip():
-        cmd += ["-streamid", s["streamid"].strip()]
-    cmd.append(build_srt_url(s))
+    if udp_port:
+        cmd.append(f"udp://127.0.0.1:{udp_port}?pkt_size=1316&buffer_size=8388608")
+    else:
+        if s["passphrase"]:
+            cmd += ["-passphrase", "********" if mask_secrets else s["passphrase"],
+                    "-pbkeylen", str(s["pbkeylen"])]
+        if s["streamid"].strip():
+            cmd += ["-streamid", s["streamid"].strip()]
+        cmd.append(build_srt_url(s))
     if preview:
         cmd += preview_output_args(preview)
     return cmd
@@ -877,6 +982,8 @@ def load_config():
         pass
     if not ffmpeg_exists(cfg["ffmpeg"]):
         cfg["ffmpeg"] = DEFAULTS["ffmpeg"]
+    if not ffmpeg_exists(cfg["slt"]):
+        cfg["slt"] = DEFAULTS["slt"]
     return cfg
 
 
@@ -948,6 +1055,7 @@ class Fonts:
         self.label = F(8, "bold")
         self.title = F(13, "bold")
         self.stat = F(18, "bold")
+        self.stat_sm = F(13, "bold")
         self.button = F(10, "bold")
         self.button_lg = F(12, "bold")
         self.mono = F(9, family=mono)
@@ -1219,32 +1327,43 @@ class Meter(tk.Canvas):
         self.tag_raise("grid")
 
 
-class Sparkline(tk.Canvas):
-    def __init__(self, parent, height=46, bg=None):
+class BandwidthGraph(tk.Canvas):
+    """Network send rate over time (area), the configured target (dashed) and red ticks where
+    SRT reported lost or dropped packets."""
+
+    def __init__(self, parent, height=58, bg=None):
         super().__init__(parent, height=height, highlightthickness=0, bd=0, bg=bg or C["card"])
-        self.values, self.ceiling = [], 1.0
+        self.points, self.target, self.n = [], 0.0, 120
         self.bind("<Configure>", lambda e: self._draw())
 
-    def set(self, values, ceiling):
-        self.values, self.ceiling = list(values), max(ceiling, 1.0)
+    def set(self, points, target):
+        """points: [(mbps, trouble)] where trouble is 0 (none), 1 (loss/retransmits) or 2 (drops)."""
+        self.points, self.target = list(points)[-self.n:], target
         self._draw()
 
     def _draw(self):
         self.delete("all")
         w, h = self.winfo_width(), self.winfo_height()
-        n = 90
-        for frac in (0.5,):
-            self.create_line(0, h * frac, w, h * frac, fill=C["border"], dash=(2, 4))
-        if len(self.values) < 2:
+        vals = [p[0] for p in self.points]
+        top = max(vals + [self.target * 1.25, 0.5])
+        y = lambda v: h - 4 - (min(v, top) / top) * (h - 14)
+        if self.target:
+            ty = y(self.target)
+            self.create_line(0, ty, w, ty, fill=C["faint"], dash=(3, 4))
+        self.create_text(w - 2, 1, anchor="ne", text=f"{top:.1f} Mbps", fill=C["faint"], font=("TkDefaultFont", 7))
+        if len(vals) < 2:
             return
-        vals = self.values[-n:]
-        step = w / (n - 1)
+        step = w / (self.n - 1)
         x0 = w - step * (len(vals) - 1)
         pts = []
         for i, v in enumerate(vals):
-            pts += [x0 + i * step, h - 2 - (min(v, self.ceiling) / self.ceiling) * (h - 6)]
+            pts += [x0 + i * step, y(v)]
         self.create_polygon([x0, h] + pts + [pts[-2], h], fill="#16284a", outline="")
-        self.create_line(pts, fill=C["accent"], width=2, smooth=True)
+        self.create_line(pts, fill=C["accent"], width=2)
+        for i, (_v, trouble) in enumerate(self.points):
+            if trouble:
+                x = x0 + i * step
+                self.create_line(x, h - 1, x, h - 8, fill=C["live"] if trouble == 2 else C["warn"], width=2)
 
 
 # ==========================================================================
@@ -1264,8 +1383,8 @@ class App(tk.Tk):
         self.withdraw()
         self.title(APP_NAME)
         self.k = max(1.0, self.winfo_fpixels("1i") / 96.0)  # UI scale for pixel sizes
-        self.geometry(f"{self.S(1280)}x{self.S(820)}")
-        self.minsize(self.S(1120), self.S(720))
+        self.geometry(f"{self.S(1300)}x{self.S(900)}")
+        self.minsize(self.S(1160), self.S(780))
         self.configure(bg=C["bg"])
         self.fonts = Fonts(self)
         setup_style(self, self.fonts)
@@ -1290,13 +1409,18 @@ class App(tk.Tk):
         self.restart_job = None
         self.started_at = None
         self.recent_lines = collections.deque(maxlen=40)
-        self.bitrate_hist = collections.deque(maxlen=120)
         self._frame = None
         self._shown_frame = None
         self._photo = None
         self._meter_acc = {}
         self.pump = None
         self.pump_reported = False
+        self.slt = None            # srt-live-transmit process when detailed SRT stats are on
+        self.slt_mode = False
+        self.bw_points = collections.deque(maxlen=120)
+        self.srt_prev = None
+        self.enc_prev = None
+        self.rtt_range = None
         self._last_tick = time.time()
         self._last_blink = 0.0
         self.log_open = False
@@ -1329,8 +1453,11 @@ class App(tk.Tk):
         self.msg = tk.StringVar(value="Ready. Pick your sources, enter the SRT destination, then Go Live.")
         self.receiver = tk.StringVar()
         self.stat_vars = {k: tk.StringVar(value="—") for k in
-                          ("bitrate", "bitrate_sub", "fps", "fps_sub", "drop", "drop_sub", "uptime", "uptime_sub")}
+                          ("bitrate", "bitrate_sub", "fps", "fps_sub", "drop", "drop_sub", "uptime", "uptime_sub",
+                           "q", "q_sub", "rtt", "rtt_sub", "loss", "loss_sub", "retx", "retx_sub",
+                           "pdrop", "pdrop_sub", "buf", "buf_sub")}
         self.show_pass = tk.BooleanVar(value=False)
+        self.slt_status = tk.StringVar(value="")
 
     def settings(self):
         return {k: v.get() for k, v in self.vars.items()}
@@ -1419,14 +1546,14 @@ class App(tk.Tk):
         stats.grid(row=2, column=0, sticky="ew")
         for i, w in enumerate((3, 2, 2, 2)):
             stats.columnconfigure(i, weight=w, minsize=S(150 if i else 260))
-        cards = [("BITRATE", "bitrate"), ("FRAME RATE", "fps"), ("DROPPED FRAMES", "drop"), ("UPTIME", "uptime")]
+        cards = [("BANDWIDTH", "bitrate"), ("FRAME RATE", "fps"), ("DROPPED FRAMES", "drop"), ("UPTIME", "uptime")]
         for i, (title, key) in enumerate(cards):
             card = self._card(stats, row=0, column=i, sticky="nsew", padx=(0 if i == 0 else S(10), 0))
             if key == "bitrate":
                 card.columnconfigure(1, weight=1)
                 txt = tk.Frame(card, bg=C["card"])
                 txt.grid(row=0, column=0, sticky="nw")
-                self.spark = Sparkline(card, height=S(50))
+                self.spark = BandwidthGraph(card, height=S(58))
                 self.spark.grid(row=0, column=1, sticky="nsew", padx=(S(14), 0))
                 target = txt
             else:
@@ -1437,9 +1564,27 @@ class App(tk.Tk):
             tk.Label(target, textvariable=self.stat_vars[key + "_sub"], font=F.small, bg=C["card"],
                      fg=C["muted"]).pack(anchor="w")
 
+        # SRT link statistics (from srt-live-transmit)
+        link = tk.Frame(main, bg=C["bg"])
+        link.grid(row=3, column=0, sticky="ew", pady=(S(10), 0))
+        link_cards = [("SRT LINK", "q"), ("ROUND-TRIP", "rtt"), ("PACKET LOSS", "loss"),
+                      ("RETRANSMITTED", "retx"), ("DROPPED PACKETS", "pdrop"), ("SEND BUFFER", "buf")]
+        self.link_value_lbls = {}
+        for i, (title, key) in enumerate(link_cards):
+            link.columnconfigure(i, weight=1, uniform="link")
+            card = tk.Frame(link, bg=C["card"], highlightthickness=1, highlightbackground=C["border"],
+                            padx=S(11), pady=S(8))
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else S(8), 0))
+            tk.Label(card, text=title, font=F.label, bg=C["card"], fg=C["muted"]).pack(anchor="w")
+            lbl = tk.Label(card, textvariable=self.stat_vars[key], font=F.stat_sm, bg=C["card"], fg=C["text"])
+            lbl.pack(anchor="w", pady=(S(1), 0))
+            self.link_value_lbls[key] = lbl
+            tk.Label(card, textvariable=self.stat_vars[key + "_sub"], font=F.small, bg=C["card"],
+                     fg=C["muted"], anchor="w").pack(anchor="w", fill="x")
+
         # Log drawer
         drawer = tk.Frame(main, bg=C["card"], highlightthickness=1, highlightbackground=C["border"])
-        drawer.grid(row=3, column=0, sticky="ew", pady=(S(12), 0))
+        drawer.grid(row=4, column=0, sticky="ew", pady=(S(12), 0))
         drawer.columnconfigure(0, weight=1)
         head = tk.Frame(drawer, bg=C["card"], padx=S(12), pady=S(8))
         head.grid(row=0, column=0, sticky="ew")
@@ -1607,6 +1752,8 @@ class App(tk.Tk):
         r = self._field(t, r, "Key length", keyseg)
         sid = ttk.Entry(t, textvariable=self.vars["streamid"], font=F.base)
         r = self._field(t, r, "Stream ID (optional)", sid)
+        r = self._check(t, r, "srt_stats", "Detailed link statistics (RTT, loss, retransmits, buffer)")
+        r = self._help(t, r, var=self.slt_status)
 
         box = tk.Frame(t, bg=C["card"], highlightthickness=1, highlightbackground=C["border"],
                        padx=S(12), pady=S(10))
@@ -1634,6 +1781,9 @@ class App(tk.Tk):
         check.grid(row=0, column=2, padx=(S(6), 0))
         self.lockables += [ffe, browse, check]
         r = self._field(t, 0, "FFmpeg location", ffrow)
+        slte = ttk.Entry(t, textvariable=self.vars["slt"], font=F.base)
+        self.lockables.append(slte)
+        r = self._field(t, r, "srt-live-transmit location (for SRT statistics)", slte)
         r = self._check(t, r, "reconnect", "Reconnect automatically if the stream drops")
         r = self._help(t, r, "Retries with a growing delay (2 s, 4 s, 8 s … up to 30 s) until you end the stream.")
 
@@ -1731,7 +1881,7 @@ class App(tk.Tk):
         video, audio = self.selected_sources()
         if video:
             try:
-                self._copy_text(cmd_to_string(build_command(self.settings(), video, audio)), "FFmpeg command copied.")
+                self._copy_text(self._commands_text(self.settings(), video, audio, mask=False), "Command copied.")
             except (ValueError, KeyError):
                 pass
 
@@ -1756,9 +1906,15 @@ class App(tk.Tk):
         self.receiver.set(receiver_url(s))
         video, audio = self.selected_sources()
         try:
-            text = cmd_to_string(build_command(s, video, audio, mask_secrets=True)) if video else "(pick a video source)"
+            text = self._commands_text(s, video, audio, mask=True) if video else "(pick a video source)"
         except (ValueError, KeyError) as e:
             text = f"(incomplete settings: {e})"
+        if s["slt"]:
+            self.slt_status.set("Uses srt-live-transmit to send the stream and report link health." if s["srt_stats"]
+                                else "Off: FFmpeg sends SRT itself (bandwidth graph shows encoder output).")
+        else:
+            self.slt_status.set("Needs srt-live-transmit (bundled with the Windows app; on Linux install "
+                                "'srt-tools'). Without it only encoder bandwidth is shown.")
         self.cmd_text.configure(state="normal")
         self.cmd_text.delete("1.0", "end")
         self.cmd_text.insert("1.0", text)
@@ -1767,6 +1923,13 @@ class App(tk.Tk):
             if self.restart_job:
                 self.after_cancel(self.restart_job)
             self.restart_job = self.after(400, self._restart_preview)
+
+    def _commands_text(self, s, video, audio, mask):
+        if use_slt(s):
+            return (cmd_to_string(build_command(s, video, audio, mask_secrets=mask, udp_port="UDP_PORT")) +
+                    "\n\n# sends it over SRT and reports link statistics:\n" +
+                    cmd_to_string(build_slt_command(s, "UDP_PORT", mask_secrets=mask)))
+        return cmd_to_string(build_command(s, video, audio, mask_secrets=mask))
 
     def _restart_preview(self):
         self.restart_job = None
@@ -1802,7 +1965,13 @@ class App(tk.Tk):
 
     def check_ffmpeg(self, show):
         ff = self.vars["ffmpeg"].get() or "ffmpeg"
-        threading.Thread(target=lambda: self.q.put(("ffcheck", (check_ffmpeg(ff), show))), daemon=True).start()
+        slt = self.vars["slt"].get()
+
+        def work():
+            info = check_ffmpeg(ff)
+            info["slt"] = check_slt(slt)
+            self.q.put(("ffcheck", (info, show)))
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_devices(self, video, audio, notes):
         self.video_map = {v["label"]: v for v in video}
@@ -1814,6 +1983,8 @@ class App(tk.Tk):
             self.vars["video"].set(next(iter(self.video_map), ""))
         if self.vars["audio"].get() not in self.audio_map:
             self.vars["audio"].set("None")
+        for line in SCAN_LOG:
+            self._write_log("Device scan: " + line, "app")
         found = f"Found {len(video)} video and {len(audio)} audio source(s)."
         self.notes.set("\n\n".join([found] + notes))
         self._on_settings_changed()
@@ -1827,7 +1998,8 @@ class App(tk.Tk):
             return
         version = info["version"].replace("ffmpeg version ", "FFmpeg ")
         if info["srt"]:
-            self.ff_status.set(f"✓  {version}  ·  SRT supported")
+            extra = f"  ·  srt-live-transmit {info['slt']}" if info.get("slt") else ""
+            self.ff_status.set(f"✓  {version}  ·  SRT supported{extra}")
             self.ff_lbl.configure(fg=C["muted"])
         else:
             self.ff_status.set(f"✕  {version} has no SRT support. Use a build with libsrt.")
@@ -1865,7 +2037,7 @@ class App(tk.Tk):
             save_config(s)
             self.want_stream = True
             self.retry_count = 0
-            self.bitrate_hist.clear()
+            self.bw_points.clear()
             self._stop_proc(then=self._sync)
         self._update_controls()
 
@@ -1931,7 +2103,8 @@ class App(tk.Tk):
                 self.stat_vars[k].set("—")
                 self.stat_vars[k + "_sub"].set("")
             self.uptime_hdr.configure(text="")
-            self.spark.set([], 1)
+        if not self.live:
+            self._reset_link_stats()
         self._update_controls()
 
     def _spawn(self, kind):
@@ -1953,19 +2126,41 @@ class App(tk.Tk):
                 return False
             pump.port = free_local_port()
             audio = dict(audio, port=pump.port, **{k: pump.format[k] for k in ("fmt", "rate", "channels")})
+        slt_mode = kind == "stream" and use_slt(s)
+        udp_port = free_local_port(socket.SOCK_DGRAM) if slt_mode else None
         try:
-            cmd = build_command(s, video, audio, stream=(kind == "stream"), preview=preview)
-            shown = build_command(s, video, audio, mask_secrets=True, stream=(kind == "stream"), preview=preview)
+            cmd = build_command(s, video, audio, stream=(kind == "stream"), preview=preview, udp_port=udp_port)
+            shown = build_command(s, video, audio, mask_secrets=True, stream=(kind == "stream"), preview=preview,
+                                  udp_port=udp_port)
         except (ValueError, KeyError) as e:
             if pump:
                 pump.stop()
             self._set_msg(f"Check settings: {e}", "error")
             return False
+        gen = self.gen + 1
+        slt = None
+        if slt_mode:
+            slt_cmd = build_slt_command(s, udp_port)
+            self._write_log("▶ srt:  " + cmd_to_string(build_slt_command(s, udp_port, mask_secrets=True)), "cmd")
+            try:
+                slt = subprocess.Popen(slt_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+            except OSError as e:
+                if pump:
+                    pump.stop()
+                self._set_msg(f"Could not start srt-live-transmit: {e}. Turn off detailed statistics "
+                              "in the SRT tab or fix its location in Advanced.", "error")
+                self.pill.set("error")
+                return False
+            threading.Thread(target=self._slt_stats_reader, args=(slt, gen), daemon=True).start()
+            threading.Thread(target=self._slt_log_reader, args=(slt, gen), daemon=True).start()
         self._write_log(("▶ stream" if kind == "stream" else "▶ preview") + ":  " + cmd_to_string(shown), "cmd")
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, creationflags=NO_WINDOW)
         except OSError as e:
+            if slt:
+                slt.kill()
             if pump:
                 pump.stop()
             self._set_msg(f"Could not start FFmpeg: {e}. Check its location in Advanced.", "error")
@@ -1975,7 +2170,9 @@ class App(tk.Tk):
         if pump:
             pump.go.set()
         self.pump, self.pump_reported = pump, False
-        self.gen += 1
+        self.slt, self.slt_mode = slt, slt_mode
+        self.srt_prev = self.enc_prev = self.rtt_range = None
+        self.gen = gen
         self.proc, self.proc_kind = proc, kind
         self.live, self.started_at = False, None
         self.recent_lines.clear()
@@ -1984,6 +2181,22 @@ class App(tk.Tk):
         threading.Thread(target=self._stderr_reader, args=(proc, self.gen), daemon=True).start()
         threading.Thread(target=self._frame_reader, args=(proc, self.gen), daemon=True).start()
         return True
+
+    def _slt_stats_reader(self, proc, gen):
+        for raw in proc.stdout:
+            raw = raw.strip()
+            if raw.startswith(b"{"):
+                try:
+                    self.q.put(("srtstats", (gen, json.loads(raw))))
+                except ValueError:
+                    pass
+
+    def _slt_log_reader(self, proc, gen):
+        for raw in proc.stderr:
+            line = raw.decode("utf-8", "replace").strip()
+            if line:
+                self.q.put(("sltline", (gen, line)))
+        self.q.put(("sltexit", (gen, proc.wait())))
 
     def _stderr_reader(self, proc, gen):
         buf = b""
@@ -2035,7 +2248,8 @@ class App(tk.Tk):
         if m:
             if self.proc_kind != "stream":
                 return
-            if not self.live:
+            self._encoder_rate(line)
+            if not self.live and not self.slt_mode:
                 self.live = True
                 self.started_at = time.time()
                 self.retry_count = 0
@@ -2047,14 +2261,6 @@ class App(tk.Tk):
             target = self.vars["fps"].get()
             self.stat_vars["fps"].set(f"{float(fps):.0f}")
             self.stat_vars["fps_sub"].set(f"target {target} · speed {m.group(4)}")
-            br = re.match(r"([\d.]+)kbits/s", m.group(3))
-            if br:
-                kbps = float(br.group(1))
-                self.bitrate_hist.append(kbps)
-                self.stat_vars["bitrate"].set(f"{kbps / 1000:.2f} Mbps" if kbps >= 1000 else f"{kbps:.0f} kbps")
-                target_kbps = float(self.vars["vbitrate"].get() or 0)
-                self.stat_vars["bitrate_sub"].set(f"average since start · target {target_kbps / 1000:g} Mbps")
-                self.spark.set(self.bitrate_hist, max(max(self.bitrate_hist), target_kbps) * 1.15)
             d = DROP_RE.search(line)
             if d:
                 frames = int(m.group(1))
@@ -2065,6 +2271,110 @@ class App(tk.Tk):
             return
         self.recent_lines.append(line)
         self._write_log(line, "err" if ERROR_RE.search(line) else None)
+
+    def _target_mbps(self):
+        try:
+            return (float(self.vars["vbitrate"].get()) + float(self.vars["abitrate"].get())) / 1000
+        except ValueError:
+            return 0.0
+
+    def _show_bandwidth(self, mbps, sub, trouble=0):
+        self.bw_points.append((mbps, trouble))
+        self.stat_vars["bitrate"].set(f"{mbps:.2f} Mbps" if mbps >= 1 else f"{mbps * 1000:.0f} kbps")
+        self.stat_vars["bitrate_sub"].set(sub)
+        self.spark.set(self.bw_points, self._target_mbps())
+
+    def _encoder_rate(self, line):
+        """Instantaneous encoder output rate from FFmpeg's size/time progress (when SRT stats are off)."""
+        m = re.search(r"size=\s*(\d+)\s*(KiB|kB|MiB|MB)?.*?time=\s*(\d+):(\d+):([\d.]+)", line)
+        if not m:
+            return
+        size = int(m.group(1)) * (1024 * 1024 if m.group(2) in ("MiB", "MB") else 1024)
+        t = int(m.group(3)) * 3600 + int(m.group(4)) * 60 + float(m.group(5))
+        prev, self.enc_prev = self.enc_prev, (size, t)
+        if self.slt_mode or not prev or t - prev[1] < 0.4:
+            return
+        mbps = (size - prev[0]) * 8 / (t - prev[1]) / 1e6
+        self._show_bandwidth(max(mbps, 0.0), f"encoder output · target {self._target_mbps():g} Mbps")
+
+    def _handle_slt_line(self, gen, line):
+        if gen != self.gen:
+            return
+        self.recent_lines.append(line)
+        low = line.lower()
+        self._write_log("srt: " + line, "err" if ERROR_RE.search(line) or "disconnected" in low else None)
+        if "connected" in low and "dis" not in low and self.proc_kind == "stream" and not self.live:
+            self.live = True
+            self.started_at = time.time()
+            self.retry_count = 0
+            self.pill.set("live")
+            self._set_msg(f"You're live → {self.vars['host'].get() or 'receiver'}:{self.vars['port'].get()}", "ok")
+            self._write_log("● Stream is live.", "app")
+            self._draw_badge()
+
+    def _on_slt_exit(self, gen, rc):
+        if gen != self.gen or not self.proc or self.pending:
+            return
+        self.recent_lines.append(f"srt-live-transmit stopped (code {rc}): the SRT connection ended or failed")
+        threading.Thread(target=graceful_stop, args=(self.proc,), daemon=True).start()
+
+    def _handle_srt_stats(self, gen, d):
+        if gen != self.gen or not self.slt_mode:
+            return
+        link, snd = d.get("link", {}), d.get("send", {})
+        rtt, cap = float(link.get("rtt", 0)), float(link.get("bandwidth", 0))
+        pk, lost = int(snd.get("packets", 0)), int(snd.get("packetsLost", 0))
+        retx, drop = int(snd.get("packetsRetransmitted", 0)), int(snd.get("packetsDropped", 0))
+        msbuf, rate = float(snd.get("msBuf", 0)), float(snd.get("mbitRate", 0))
+        prev, self.srt_prev = self.srt_prev, (pk, lost, retx, drop)
+        dpk, dlost, dretx, ddrop = ((pk - prev[0], lost - prev[1], retx - prev[2], drop - prev[3])
+                                    if prev else (pk, lost, retx, drop))
+        loss_now = 100.0 * dlost / max(dpk, 1)
+        retx_now = 100.0 * dretx / max(dpk, 1)
+        try:
+            latency = float(self.vars["latency"].get())
+        except ValueError:
+            latency = 200.0
+        lo, hi = self.rtt_range or (rtt, rtt)
+        self.rtt_range = (min(lo, rtt), max(hi, rtt))
+
+        if ddrop > 0 or loss_now > 5 or msbuf > 0.8 * latency:
+            quality, color, why = "Poor", C["live"], ("packets dropped" if ddrop else
+                                                      "heavy loss" if loss_now > 5 else "buffer filling")
+        elif loss_now > 1 or retx_now > 2 or msbuf > 0.5 * latency:
+            quality, color, why = "Fair", C["warn"], "some loss" if loss_now > 1 or retx_now > 2 else "buffer growing"
+        else:
+            quality, color, why = "Good", C["ok"], "stable"
+        self.stat_vars["q"].set(quality)
+        self.link_value_lbls["q"].configure(fg=color)
+        self.stat_vars["q_sub"].set(f"{why} · cap ≈ {cap:.0f} Mbps" if cap else why)
+        self.stat_vars["rtt"].set(f"{rtt:.0f} ms" if rtt >= 1 else f"{rtt:.1f} ms")
+        self.stat_vars["rtt_sub"].set(f"range {self.rtt_range[0]:.0f}–{self.rtt_range[1]:.0f} ms")
+        self.stat_vars["loss"].set(f"{100.0 * lost / max(pk, 1):.2f}%")
+        self.stat_vars["loss_sub"].set(f"now {loss_now:.1f}% · {lost} pkts")
+        self.stat_vars["retx"].set(f"{retx}")
+        self.stat_vars["retx_sub"].set(f"{100.0 * retx / max(pk, 1):.2f}% of {pk} sent")
+        self.stat_vars["pdrop"].set(f"{drop}")
+        self.link_value_lbls["pdrop"].configure(fg=C["live"] if drop else C["text"])
+        self.stat_vars["pdrop_sub"].set("too late to resend" if drop else "none lost for good")
+        self.stat_vars["buf"].set(f"{msbuf:.0f} ms")
+        self.link_value_lbls["buf"].configure(fg=color if msbuf > 0.5 * latency else C["text"])
+        self.stat_vars["buf_sub"].set(f"of {latency:.0f} ms latency")
+        trouble = 2 if ddrop else (1 if dlost or dretx else 0)
+        self._show_bandwidth(rate, f"network send · target {self._target_mbps():g} Mbps"
+                                   + (f" · link ≈ {cap:.0f} Mbps" if cap else ""), trouble)
+
+    def _reset_link_stats(self):
+        for k in ("q", "rtt", "loss", "retx", "pdrop", "buf"):
+            self.stat_vars[k].set("—")
+            self.stat_vars[k + "_sub"].set("")
+            self.link_value_lbls[k].configure(fg=C["text"])
+        s = self.settings()
+        if self.want_stream and not use_slt(s):
+            self.stat_vars["q"].set("Off")
+            self.stat_vars["q_sub"].set("needs srt-live-transmit" if not s["slt"] else "off in SRT tab")
+        self.bw_points.clear()
+        self.spark.set([], self._target_mbps())
 
     HINTS = (
         ("extends outside window area", "GDI capture can't handle this monitor layout (mixed display "
@@ -2091,6 +2401,10 @@ class App(tk.Tk):
             return
         kind = self.proc_kind
         self.proc, self.proc_kind, self.live = None, None, False
+        if self.slt:
+            if self.slt.poll() is None:
+                self.slt.terminate()
+            self.slt = None
         if self.pump:
             self.pump.stop()
             if self.pump.error:
@@ -2137,6 +2451,12 @@ class App(tk.Tk):
                     self._apply_devices(*payload)
                 elif kind == "ffcheck":
                     self._apply_ffcheck(*payload)
+                elif kind == "srtstats":
+                    self._handle_srt_stats(*payload)
+                elif kind == "sltline":
+                    self._handle_slt_line(*payload)
+                elif kind == "sltexit":
+                    self._on_slt_exit(*payload)
         except queue.Empty:
             pass
 
@@ -2190,6 +2510,8 @@ class App(tk.Tk):
             self.pump.stop()
         if self.proc:
             graceful_stop(self.proc, timeout=3)
+        if self.slt and self.slt.poll() is None:
+            self.slt.terminate()
         self.destroy()
 
 
