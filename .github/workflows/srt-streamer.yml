@@ -100,6 +100,10 @@ jobs:
       - name: Put srt-live-transmit on PATH (source tests)
         run: '"$PWD\vendor\srt" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8'
 
+      - name: Diagnose srt-live-transmit on Windows
+        continue-on-error: true
+        run: python tools/diag_slt.py vendor/ffmpeg.exe vendor/srt/srt-live-transmit.exe out/diag
+
       - name: Self-test from source (GDI capture)
         run: |
           python srt_streamer.py --self-test out/source-gdigrab.json --capture gdigrab
