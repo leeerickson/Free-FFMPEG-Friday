@@ -101,12 +101,20 @@ jobs:
         run: '"$PWD\vendor\srt" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8'
 
       - name: Self-test from source (GDI capture)
-        run: python srt_streamer.py --self-test out/source-gdigrab.json --capture gdigrab
+        run: |
+          python srt_streamer.py --self-test out/source-gdigrab.json --capture gdigrab
+          $code = $LASTEXITCODE
+          if (Test-Path out/source-gdigrab.json) { Get-Content out/source-gdigrab.json }
+          exit $code
 
       - name: Self-test from source (GPU capture, ddagrab)
         # Hosted runners have no GPU; Desktop Duplication may or may not work there.
         continue-on-error: true
-        run: python srt_streamer.py --self-test out/source-ddagrab.json --capture ddagrab
+        run: |
+          python srt_streamer.py --self-test out/source-ddagrab.json --capture ddagrab
+          $code = $LASTEXITCODE
+          if (Test-Path out/source-ddagrab.json) { Get-Content out/source-ddagrab.json }
+          exit $code
 
       - name: Build single-file exe (FFmpeg bundled)
         run: |

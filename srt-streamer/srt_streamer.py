@@ -69,7 +69,7 @@ ENCODER_ARGS = {
     "h264_amf": ["-usage", "lowlatency", "-rc", "cbr"],
     "h264_videotoolbox": ["-realtime", "1", "-allow_sw", "1"],
 }
-SCALES = {"Native": None, "1080p": 1080, "720p": 720, "540p": 540, "480p": 480}
+SCALES = {"Native": None, "2160p": 2160, "1440p": 1440, "1080p": 1080, "720p": 720, "540p": 540, "480p": 480}
 MODE_HINTS = {
     "caller": "Push the stream to a receiver that is listening at Host : Port.",
     "listener": "Wait on Port for the receiver to connect to this computer. "
@@ -124,6 +124,8 @@ def ffmpeg_exists(path):
 
 DEFAULTS = {
     "ffmpeg": find_ffmpeg(),
+    "content": "screen",
+    "budget": "",
     "video": "",
     "audio": "None",
     "draw_mouse": True,
@@ -644,7 +646,7 @@ def enumerate_sources(ff):
                 for idx, (dev, (l, t, r, b), hmon) in enumerate(dxgi_outputs()):
                     main = " (main)" if (l, t) == (0, 0) else ""
                     video.append({"label": f"Screen {idx + 1}{main}  ·  {r - l}x{b - t}  ·  {dev.lstrip(chr(92) + '.')}",
-                                  "type": "ddagrab", "index": idx})
+                                  "type": "ddagrab", "index": idx, "w": r - l, "h": b - t})
                     covered.add(hmon)
             except Exception:
                 pass
@@ -918,6 +920,307 @@ def build_command(s, video, audio, mask_secrets=False, stream=True, preview=None
     if preview:
         cmd += preview_output_args(preview)
     return cmd
+
+
+# ==========================================================================
+# Bandwidth analyzer: measure the link, predict quality, recommend settings
+# Quality model adapted from the VMAF Estimator (StreamingIdiot.com):
+#   VMAF ≈ 100 × (1 − e^(−42 × bits-per-pixel × efficiency))
+# ==========================================================================
+CONTENT_TYPES = [("screen", "Screen", 1.25), ("talk", "Talking head", 1.25),
+                 ("film", "Film / TV", 1.00), ("sports", "Sports / Games", 0.78)]
+CODEC_EFFICIENCY = {"h264": 1.00, "hevc": 1.45, "av1": 1.70}
+GOP_EFFICIENCY = ((0.5, 0.84), (1.0, 0.92), (2.0, 1.00), (4.0, 1.04))
+LADDER = [(2160, 3840), (1440, 2560), (1080, 1920), (720, 1280), (540, 960), (480, 854)]
+LINK_TEST_STEPS = [1, 2, 3, 5, 8, 12, 16, 20, 25, 30, 40, 50]  # Mbps
+
+
+def vmaf_label(v):
+    return ("Visually lossless" if v >= 93 else "Excellent" if v >= 85 else
+            "Acceptable" if v >= 70 else "Poor")
+
+
+def encoder_efficiency(encoder, keyint):
+    """Efficiency of this app's live encode: codec × fast preset × GOP × B-frames."""
+    name = encoder.split()[0]
+    codec = "hevc" if ("265" in name or "hevc" in name) else "av1" if "av1" in name else "h264"
+    try:
+        k = float(keyint)
+    except ValueError:
+        k = 2.0
+    gop = GOP_EFFICIENCY[0][1]
+    for seconds, eff in GOP_EFFICIENCY:  # step through the table (interpolating)
+        if k >= seconds:
+            gop = eff
+    bframes = 0.97 if name == "h264_qsv" else 0.85  # the low-latency settings here use no B-frames
+    return CODEC_EFFICIENCY[codec] * 0.92 * gop * bframes  # 0.92 = fast/real-time preset
+
+
+def predict_vmaf(video_kbps, w, h, fps, eff):
+    import math
+    bpp = video_kbps * 1000.0 / (w * h * fps)
+    return max(0.0, min(99.0, 100.0 * (1 - math.exp(-42.0 * bpp * eff))))
+
+
+def required_kbps(vmaf, w, h, fps, eff):
+    import math
+    return (-math.log(1 - vmaf / 100.0) / 42.0 / eff) * w * h * fps / 1000.0
+
+
+def recommend(budget_kbps, audio_kbps, encoder, keyint, content, source_height=None):
+    """Rank resolution × frame-rate options for a total bandwidth budget.
+
+    Returns (rows, best, video_kbps). Picks the highest resolution (then frame rate) that reaches
+    VMAF 93; if none does, the best-scoring option. Motion-heavy content tries 60 fps first.
+    """
+    factor = next((f for key, _l, f in CONTENT_TYPES if key == content), 1.0)
+    eff = encoder_efficiency(encoder, keyint) * factor
+    video = max(150.0, budget_kbps - audio_kbps)
+    fps_order = (60, 30) if content in ("sports", "film") else (30, 60)
+    rows = []
+    for h, w in LADDER:
+        if source_height and h > source_height:
+            continue
+        for fps in fps_order:
+            v = predict_vmaf(video, w, h, fps, eff)
+            rows.append({"h": h, "w": w, "fps": fps, "vmaf": v,
+                         "kbps97": required_kbps(97, w, h, fps, eff)})
+    if not rows:
+        return [], None, video
+    best = next((r for r in rows if r["vmaf"] >= 93), None) or max(rows, key=lambda r: r["vmaf"])
+    kbps = max(300, int(round(min(video, best["kbps97"]) / 100.0)) * 100)  # no point beyond ~VMAF 97
+    return rows, best, kbps
+
+
+def recommend_latency(rtt_ms, loss_pct=0.0):
+    """SRT latency: about 4× RTT (6× on lossy links), at least 120 ms, rounded up to 10 ms."""
+    mult = 6 if loss_pct > 1 else 4
+    return int(-(-max(120.0, mult * rtt_ms) // 10) * 10)
+
+
+TS_NULL_PACKETS = (b"\x47\x1f\xff\x10" + b"\xff" * 184) * 7  # 7 MPEG-TS null packets = 1316 bytes
+
+
+class PaddingRelay(threading.Thread):
+    """Forwards FFmpeg's MPEG-TS from one local UDP port to another and tops it up with MPEG-TS
+    null packets (which receivers discard) to hit an adjustable total bitrate."""
+
+    def __init__(self, in_port, out_port):
+        super().__init__(daemon=True)
+        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rx.bind(("127.0.0.1", in_port))
+        self.rx.setblocking(False)
+        self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.tx.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
+        self.dest = ("127.0.0.1", out_port)
+        self.target_bps = 0.0
+        self.stopped = threading.Event()
+
+    def run(self):
+        budget, last = 0.0, time.monotonic()
+        try:
+            while not self.stopped.is_set():
+                now = time.monotonic()
+                budget = min(budget + self.target_bps * (now - last) / 8.0, self.target_bps / 8.0 * 0.05 + 1316)
+                last = now
+                while True:  # real stream first
+                    try:
+                        data = self.rx.recv(65536)
+                    except (BlockingIOError, InterruptedError):
+                        break
+                    self.tx.sendto(data, self.dest)
+                    budget -= len(data)
+                while budget >= 1316:  # then padding up to the target rate
+                    self.tx.sendto(TS_NULL_PACKETS, self.dest)
+                    budget -= 1316
+                time.sleep(0.001)
+        except OSError:
+            pass
+        finally:
+            self.rx.close()
+            self.tx.close()
+
+    def stop(self):
+        self.stopped.set()
+
+
+class LinkTest(threading.Thread):
+    """Ramps a test stream over the configured SRT connection and finds the highest bitrate the link
+    carries cleanly. Progress and the result go to `report(kind, payload)` from this thread."""
+
+    def __init__(self, s, report, steps=None, step_seconds=3.0):
+        super().__init__(daemon=True)
+        self.s, self.report = dict(s), report
+        self.steps = steps or LINK_TEST_STEPS
+        self.step_seconds = step_seconds
+        self.stopped = threading.Event()
+        self.procs = []
+
+    def stop(self):
+        self.stopped.set()
+
+    def _launch(self, cmd, **kw):
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, **kw)
+        self.procs.append(p)
+        return p
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:
+            self.report("linktest_done", {"ok": False, "error": str(e) or repr(e)})
+        finally:
+            for p in self.procs:
+                if p.poll() is None:
+                    p.terminate()
+            if getattr(self, "relay", None):
+                self.relay.stop()
+
+    def _run(self):
+        s = self.s
+        try:
+            latency = float(s["latency"])
+        except ValueError:
+            latency = 200.0
+        in_port, out_port = free_local_port(socket.SOCK_DGRAM), free_local_port(socket.SOCK_DGRAM)
+        slt_cmd = build_slt_command(dict(s, vbitrate="400", abitrate="0"), out_port)
+        slt_cmd[1] = "-s:50"  # frequent reports for short test steps
+        slt = self._launch(slt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        events = queue.Queue()
+
+        def read_stats():
+            for raw in slt.stdout:
+                raw = raw.strip()
+                if raw.startswith(b"{"):
+                    try:
+                        events.put(("stats", time.monotonic(), json.loads(raw)))
+                    except ValueError:
+                        pass
+
+        def read_log():
+            for raw in slt.stderr:
+                line = raw.decode("utf-8", "replace").strip()
+                low = line.lower()
+                if "connected" in low and "dis" not in low:
+                    events.put(("connected", time.monotonic(), line))
+                elif line:
+                    events.put(("log", time.monotonic(), line))
+            events.put(("exit", time.monotonic(), slt.wait()))
+
+        threading.Thread(target=read_stats, daemon=True).start()
+        threading.Thread(target=read_log, daemon=True).start()
+        self.relay = PaddingRelay(in_port, out_port)
+        self.relay.target_bps = self.steps[0] * 1e6
+        self.relay.start()
+        ff = s["ffmpeg"] or "ffmpeg"
+        self._launch([ff, "-hide_banner", "-loglevel", "error", "-re",
+                      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                      "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                      "-b:v", "300k", "-maxrate", "300k", "-bufsize", "300k", "-g", "60", "-pix_fmt", "yuv420p",
+                      "-c:a", "aac", "-b:a", "64k", "-f", "mpegts",
+                      f"udp://127.0.0.1:{in_port}?pkt_size=1316"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        self.report("linktest_progress", {"text": "Connecting to the receiver…"})
+        deadline, last_log = time.monotonic() + 20, ""
+        while True:
+            if self.stopped.is_set():
+                return self.report("linktest_done", {"ok": False, "error": "cancelled"})
+            try:
+                kind, _t, val = events.get(timeout=0.2)
+            except queue.Empty:
+                if time.monotonic() > deadline:
+                    raise OSError("no receiver answered within 20 s. Start the receiver (or check host, "
+                                  "port and passphrase) and try again")
+                continue
+            if kind == "connected":
+                break
+            if kind == "log":
+                last_log = val
+            if kind == "exit":
+                raise OSError(f"the SRT connection failed ({last_log or 'no details'})")
+
+        results, rtts, prev = [], [], None
+        for mbps in self.steps:
+            self.relay.target_bps = mbps * 1e6
+            t_start = time.monotonic()
+            first = last = None
+            max_buf = 0.0
+            self.report("linktest_progress", {"text": f"Testing {mbps} Mbps…", "step": mbps, "results": results})
+            while time.monotonic() - t_start < self.step_seconds:
+                if self.stopped.is_set():
+                    return self.report("linktest_done", {"ok": False, "error": "cancelled"})
+                try:
+                    kind, t, val = events.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if kind == "exit":
+                    first = None
+                    results.append({"mbps": mbps, "ok": False, "why": "connection dropped"})
+                    break
+                if kind != "stats" or t - t_start < 1.0:  # let each step settle for a second
+                    continue
+                snd, link = val.get("send", {}), val.get("link", {})
+                sample = (t, int(snd.get("bytes", 0)), int(snd.get("packets", 0)), int(snd.get("packetsLost", 0)),
+                          int(snd.get("packetsRetransmitted", 0)), int(snd.get("packetsDropped", 0)))
+                first = first or sample
+                last = sample
+                max_buf = max(max_buf, float(snd.get("msBuf", 0)))
+                rtts.append(float(link.get("rtt", 0)))
+            else:
+                if not first or last is first:
+                    results.append({"mbps": mbps, "ok": False, "why": "no statistics"})
+                else:
+                    dt = last[0] - first[0]
+                    achieved = (last[1] - first[1]) * 8 / max(dt, 0.001) / 1e6
+                    dpk = max(last[2] - first[2], 1)
+                    loss = 100.0 * (last[3] - first[3]) / dpk
+                    retx = 100.0 * (last[4] - first[4]) / dpk
+                    drops = last[5] - first[5]
+                    why = ("packets dropped" if drops else "packet loss" if loss > 3 else
+                           "send buffer filling" if max_buf > max(150.0, 0.5 * latency) else
+                           "couldn't reach the rate" if achieved < 0.85 * mbps else "")
+                    results.append({"mbps": mbps, "ok": not why, "why": why, "achieved": achieved,
+                                    "loss": loss, "retx": retx, "buf": max_buf})
+            self.report("linktest_progress", {"text": f"{mbps} Mbps: " + ("OK" if results[-1]["ok"]
+                                              else results[-1]["why"]), "results": results})
+            if not results[-1]["ok"]:
+                break
+        passed = [r for r in results if r["ok"]]
+        rtt = sorted(rtts)[len(rtts) // 2] if rtts else 0.0
+        loss = max((r.get("loss", 0) for r in passed), default=0.0)
+        self.report("linktest_done", {
+            "ok": bool(passed), "results": results, "rtt": rtt, "loss": loss,
+            "capacity_kbps": (passed[-1]["achieved"] * 1000 if passed else 0),
+            "maxed_out": bool(passed) and passed[-1]["mbps"] == self.steps[-1], "top_mbps": self.steps[-1],
+            "error": None if passed else (results[0]["why"] if results else "no result")})
+
+
+def internet_upload_test(report, megabytes=8):
+    """Quick general upload check against Cloudflare's speed-test endpoint (like the VMAF Estimator)."""
+    import http.client
+    try:
+        conn = http.client.HTTPSConnection("speed.cloudflare.com", timeout=30)
+        pings = []
+        for _ in range(4):
+            t = time.monotonic()
+            conn.request("GET", "/__down?bytes=0")
+            conn.getresponse().read()
+            pings.append((time.monotonic() - t) * 1000)
+        report("nettest_progress", {"text": f"Ping {min(pings[1:]):.0f} ms. Uploading {megabytes} MB…"})
+        body = os.urandom(megabytes * 1024 * 1024)
+        t = time.monotonic()
+        conn.request("POST", "/__up", body=body, headers={"Content-Type": "application/octet-stream"})
+        conn.getresponse().read()
+        secs = max(time.monotonic() - t, 0.05)
+        conn.close()
+        report("nettest_done", {"ok": True, "upload_kbps": len(body) * 8 / secs / 1000, "rtt": min(pings[1:])})
+    except Exception as e:
+        report("nettest_done", {"ok": False, "error": str(e) or repr(e)})
 
 
 def local_ip():
@@ -1458,6 +1761,11 @@ class App(tk.Tk):
                            "pdrop", "pdrop_sub", "buf", "buf_sub")}
         self.show_pass = tk.BooleanVar(value=False)
         self.slt_status = tk.StringVar(value="")
+        self.bw_progress = tk.StringVar(value="Measure the link to your receiver, or type a budget below.")
+        self.bw_summary = tk.StringVar(value="")
+        self.bw_measured = None   # {"source", "capacity_kbps", "rtt", "loss"}
+        self.bw_test = None
+        self.bw_rec = None
 
     def settings(self):
         return {k: v.get() for k, v in self.vars.items()}
@@ -1619,8 +1927,9 @@ class App(tk.Tk):
                                fg=C["muted"], anchor="w", justify="left", wraplength=S(350))
         self.ff_lbl.pack(fill="x")
 
-        tabs = [("sources", "Sources"), ("encoding", "Encoding"), ("srt", "SRT"), ("advanced", "Advanced")]
-        self.tabbar = TabBar(side, tabs, F.bold, self._show_tab)
+        tabs = [("sources", "Sources"), ("encoding", "Encoding"), ("srt", "SRT"), ("bandwidth", "Bandwidth"),
+                ("advanced", "Advanced")]
+        self.tabbar = TabBar(side, tabs, F.small_bold, self._show_tab)
         self.tabbar.pack(side="top", fill="x", padx=S(12), pady=(S(6), 0))
         tk.Frame(side, bg=C["border"], height=1).pack(side="top", fill="x")
         self.lock_anchor = tk.Frame(side, bg=C["panel"], height=0)
@@ -1641,6 +1950,7 @@ class App(tk.Tk):
         self._build_tab_sources(self.tabs["sources"])
         self._build_tab_encoding(self.tabs["encoding"])
         self._build_tab_srt(self.tabs["srt"])
+        self._build_tab_bandwidth(self.tabs["bandwidth"])
         self._build_tab_advanced(self.tabs["advanced"])
         self.widget_states = {w: str(w.cget("state")) for w in self.lockables if isinstance(w, ttk.Widget)}
         self.tabbar.select("sources")
@@ -1768,6 +2078,42 @@ class App(tk.Tk):
         tk.Label(box, text="Use this in ffplay, OBS (Media Source) or another FFmpeg-based receiver.",
                  font=F.small, bg=C["card"], fg=C["muted"], wraplength=S(320), justify="left").grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(S(4), 0))
+
+    def _build_tab_bandwidth(self, t):
+        S, F = self.S, self.fonts
+        btns = ttk.Frame(t)
+        btns.columnconfigure(0, weight=3, uniform="bw")
+        btns.columnconfigure(1, weight=2, uniform="bw")
+        self.linktest_btn = RoundButton(btns, "Test SRT link", self.toggle_link_test, F.small_bold, kind="primary",
+                                        width=S(180), height=S(34), parent_bg=C["panel"])
+        self.linktest_btn.grid(row=0, column=0, sticky="ew")
+        self.nettest_btn = RoundButton(btns, "Internet test", self.run_internet_test, F.small_bold,
+                                       width=S(120), height=S(34), parent_bg=C["panel"])
+        self.nettest_btn.grid(row=0, column=1, sticky="ew", padx=(S(6), 0))
+        r = self._field(t, 0, "Measure", btns)
+        lbl = ttk.Label(t, textvariable=self.bw_progress, style="Help.TLabel", wraplength=S(340), justify="left")
+        lbl.grid(row=r, column=0, columnspan=2, sticky="w", pady=(S(6), 0))
+        r += 1
+        self._field(t, r, "Budget (kbps)", self._spin(t, "budget", 300, 100000, 250), col=0, span=1)
+        self._help(t, r + 1, "75% of the tested capacity (room for SRT resends). Or type your own.", col=1, span=1)
+        r += 2
+        seg = Segmented(t, self.vars["content"], [(k, l.split(" ")[0]) for k, l, _f in CONTENT_TYPES], F.small_bold)
+        r = self._field(t, r, "Content", seg)
+        self.bw_rows = tk.Frame(t, bg=C["panel"])
+        self.bw_rows.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(S(12), 0))
+        self.bw_rows.columnconfigure(2, weight=1)
+        r += 1
+        self.apply_btn = RoundButton(t, "Apply recommended settings", self.apply_recommendation, F.small_bold,
+                                     kind="primary", width=S(340), height=S(36), parent_bg=C["panel"])
+        self.apply_btn.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(S(12), 0))
+        self.lockables.append(self.apply_btn)
+        r += 1
+        ttk.Label(t, textvariable=self.bw_summary, style="Help.TLabel", wraplength=S(340), justify="left").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(S(6), 0))
+        r += 1
+        self._help(t, r, "Quality is predicted with the VMAF Estimator model (StreamingIdiot.com) for this app's "
+                         "low-latency encoder settings. The SRT test uses the SRT tab's destination; "
+                         "the internet test uses Cloudflare's speed test.")
 
     def _build_tab_advanced(self, t):
         S, F = self.S, self.fonts
@@ -1919,6 +2265,8 @@ class App(tk.Tk):
         self.cmd_text.delete("1.0", "end")
         self.cmd_text.insert("1.0", text)
         self.cmd_text.configure(state="disabled")
+        if key in (None, "budget", "content", "encoder", "keyint", "abitrate", "video"):
+            self._update_recommendation()
         if key in SOURCE_KEYS and self.want_preview and not self.want_stream:
             if self.restart_job:
                 self.after_cancel(self.restart_job)
@@ -1930,6 +2278,132 @@ class App(tk.Tk):
                     "\n\n# sends it over SRT and reports link statistics:\n" +
                     cmd_to_string(build_slt_command(s, "UDP_PORT", mask_secrets=mask)))
         return cmd_to_string(build_command(s, video, audio, mask_secrets=mask))
+
+    # ---------------------------------------------------- bandwidth analyzer
+    def toggle_link_test(self):
+        if self.bw_test:
+            self.bw_test.stop()
+            self.bw_progress.set("Stopping the test…")
+            return
+        s = self.settings()
+        if self.want_stream:
+            return self._set_msg("End the stream before testing the link.", "warn")
+        if not s["slt"]:
+            return self.bw_progress.set("The SRT link test needs srt-live-transmit (see the SRT tab).")
+        err = validate(s, {"type": "test"})
+        if err:
+            self.tabbar.select("srt")
+            return self._set_msg(err, "error")
+        self.bw_test = LinkTest(s, lambda kind, payload: self.q.put((kind, payload)))
+        self.bw_test.start()
+        self.linktest_btn.update_button(text="Stop test", kind="secondary")
+        self.nettest_btn.set_enabled(False)
+        self.live_btn.set_enabled(False)
+        self._write_log(f"Bandwidth: SRT link test to {s['host'] or 'listener'}:{s['port']} started.", "app")
+
+    def run_internet_test(self):
+        if self.bw_test or not self.nettest_btn.enabled:
+            return
+        self.nettest_btn.set_enabled(False)
+        self.linktest_btn.set_enabled(False)
+        self.bw_progress.set("Testing internet upload (Cloudflare)…")
+        threading.Thread(target=internet_upload_test, args=(lambda k, p: self.q.put((k, p)),),
+                         daemon=True).start()
+
+    def _on_bw_event(self, kind, d):
+        if kind in ("linktest_progress", "nettest_progress"):
+            text = d.get("text", "")
+            done = [f"{r['mbps']}✓" if r["ok"] else f"{r['mbps']}✗" for r in d.get("results", [])]
+            self.bw_progress.set(text + (f"   [{' '.join(done)} Mbps]" if done else ""))
+            return
+        if kind == "linktest_done":
+            self.bw_test = None
+            self.linktest_btn.update_button(text="Test SRT link", kind="primary")
+            for r in d.get("results", []):
+                self._write_log(f"Bandwidth: {r['mbps']} Mbps → " + ("OK" if r["ok"] else r["why"]) +
+                                (f" (sent {r['achieved']:.2f} Mbps, loss {r['loss']:.1f}%, buffer {r['buf']:.0f} ms)"
+                                 if "achieved" in r else ""), "app" if r["ok"] else "err")
+            if d.get("ok"):
+                cap = d["capacity_kbps"]
+                self.bw_measured = {"source": "SRT link", "capacity_kbps": cap, "rtt": d["rtt"], "loss": d["loss"]}
+                more = "+" if d.get("maxed_out") else ""
+                self.bw_progress.set(f"SRT link carried {cap / 1000:.1f}{more} Mbps cleanly · RTT {d['rtt']:.0f} ms"
+                                     + (f" (the test tops out at {d['top_mbps']} Mbps)" if more else ""))
+                self.vars["budget"].set(str(int(cap * 0.75 / 50) * 50))
+            else:
+                self.bw_progress.set(f"SRT link test: {d.get('error') or 'failed'}.")
+        elif kind == "nettest_done":
+            if d.get("ok"):
+                up = d["upload_kbps"]
+                self.bw_measured = {"source": "internet upload", "capacity_kbps": up, "rtt": d["rtt"], "loss": 0.0}
+                self.bw_progress.set(f"Internet upload {up / 1000:.1f} Mbps · ping {d['rtt']:.0f} ms (general "
+                                     f"internet, not your SRT path). Budget set to 70%.")
+                self.vars["budget"].set(str(int(up * 0.70 / 50) * 50))
+            else:
+                self.bw_progress.set(f"Internet test failed: {d.get('error')}")
+        self.nettest_btn.set_enabled(not self.want_stream)
+        self.linktest_btn.set_enabled(not self.want_stream)
+        self.live_btn.set_enabled(True)
+        self._update_recommendation()
+
+    def _update_recommendation(self):
+        if not hasattr(self, "bw_rows"):
+            return
+        for w in self.bw_rows.winfo_children():
+            w.destroy()
+        s = self.settings()
+        try:
+            budget = float(s["budget"])
+            audio_kbps = float(s["abitrate"])
+        except ValueError:
+            budget = 0
+        video, _a = self.selected_sources()
+        src_h = video.get("h") if video else None
+        if budget < 300:
+            self.bw_rec = None
+            self.bw_summary.set("Enter a budget, or run a test, to see recommendations.")
+            self.apply_btn.set_enabled(False)
+            return
+        rows, best, kbps = recommend(budget, audio_kbps, s["encoder"], s["keyint"], s["content"], src_h)
+        if not best:
+            self.bw_rec = None
+            return
+        rtt = (self.bw_measured or {}).get("rtt")
+        latency = recommend_latency(rtt, (self.bw_measured or {}).get("loss", 0)) if rtt else None
+        self.bw_rec = (best, kbps, latency, src_h)
+        F = self.fonts
+        hdr = ("OPTION", "VMAF", "QUALITY")
+        for c, text in enumerate(hdr):
+            tk.Label(self.bw_rows, text=text, font=F.label, bg=C["panel"], fg=C["faint"]).grid(
+                row=0, column=c, sticky="w", padx=(0, self.S(10)))
+        for i, r in enumerate(rows[:10], start=1):
+            chosen = r is best
+            v = r["vmaf"]
+            col = C["ok"] if v >= 93 else "#38bdf8" if v >= 85 else C["warn"] if v >= 70 else C["live"]
+            bg = "#1b2d4f" if chosen else C["panel"]
+            for c, text in enumerate((f"{r['h']}p{r['fps']}" + ("  ← best" if chosen else ""), f"{v:.1f}",
+                                      vmaf_label(v))):
+                tk.Label(self.bw_rows, text=text, font=F.small_bold if chosen else F.small, bg=bg,
+                         fg=col if c == 1 else (C["text"] if chosen else C["muted"]), anchor="w").grid(
+                    row=i, column=c, sticky="ew", padx=(0, self.S(10)), ipady=1)
+        scale = "Native" if src_h and best["h"] >= src_h else f"{best['h']}p"
+        self.bw_summary.set(f"Recommended: {scale} · {best['fps']} fps · video {kbps / 1000:.1f} Mbps "
+                            f"(+{audio_kbps:g} kbps audio)" + (f" · SRT latency {latency} ms" if latency else "") +
+                            f". Predicted VMAF {best['vmaf']:.0f}.")
+        self.apply_btn.set_enabled(not self.want_stream)
+
+    def apply_recommendation(self):
+        if not self.bw_rec or self.want_stream:
+            return
+        best, kbps, latency, src_h = self.bw_rec
+        scale = "Native" if src_h and best["h"] >= src_h else f"{best['h']}p"
+        self.vars["scale"].set(scale)
+        self.vars["fps"].set(str(best["fps"]))
+        self.vars["vbitrate"].set(str(kbps))
+        if latency:
+            self.vars["latency"].set(str(latency))
+        self._set_msg(f"Applied: {scale} · {best['fps']} fps · {kbps / 1000:.1f} Mbps"
+                      + (f" · latency {latency} ms" if latency else "") + ".", "ok")
 
     def _restart_preview(self):
         self.restart_job = None
@@ -1951,6 +2425,9 @@ class App(tk.Tk):
                     w.configure(state="disabled" if streaming else self.widget_states.get(w, "normal"))
                 except tk.TclError:
                     pass
+        if hasattr(self, "linktest_btn") and not self.bw_test:
+            self.linktest_btn.set_enabled(not streaming)
+            self.nettest_btn.set_enabled(not streaming)
         if streaming:
             self.lock_banner.pack(after=self.lock_anchor, fill="x")
         else:
@@ -2260,14 +2737,14 @@ class App(tk.Tk):
             fps = m.group(2)
             target = self.vars["fps"].get()
             self.stat_vars["fps"].set(f"{float(fps):.0f}")
-            self.stat_vars["fps_sub"].set(f"target {target} · speed {m.group(4)}")
+            self.stat_vars["fps_sub"].set(f"target {target} · {m.group(4)}")
             d = DROP_RE.search(line)
             if d:
                 frames = int(m.group(1))
                 drops = int(d.group(1))
                 self.stat_vars["drop"].set(str(drops))
                 pct = 100.0 * drops / max(frames + drops, 1)
-                self.stat_vars["drop_sub"].set(f"{pct:.1f}% of {frames + drops} frames")
+                self.stat_vars["drop_sub"].set(f"{pct:.1f}% of {frames + drops}")
             return
         self.recent_lines.append(line)
         self._write_log(line, "err" if ERROR_RE.search(line) else None)
@@ -2295,7 +2772,7 @@ class App(tk.Tk):
         if self.slt_mode or not prev or t - prev[1] < 0.4:
             return
         mbps = (size - prev[0]) * 8 / (t - prev[1]) / 1e6
-        self._show_bandwidth(max(mbps, 0.0), f"encoder output · target {self._target_mbps():g} Mbps")
+        self._show_bandwidth(max(mbps, 0.0), f"encoder output · target {self._target_mbps():.1f} Mbps")
 
     def _handle_slt_line(self, gen, line):
         if gen != self.gen:
@@ -2347,7 +2824,7 @@ class App(tk.Tk):
             quality, color, why = "Good", C["ok"], "stable"
         self.stat_vars["q"].set(quality)
         self.link_value_lbls["q"].configure(fg=color)
-        self.stat_vars["q_sub"].set(f"{why} · cap ≈ {cap:.0f} Mbps" if cap else why)
+        self.stat_vars["q_sub"].set(why)
         self.stat_vars["rtt"].set(f"{rtt:.0f} ms" if rtt >= 1 else f"{rtt:.1f} ms")
         self.stat_vars["rtt_sub"].set(f"range {self.rtt_range[0]:.0f}–{self.rtt_range[1]:.0f} ms")
         self.stat_vars["loss"].set(f"{100.0 * lost / max(pk, 1):.2f}%")
@@ -2361,7 +2838,7 @@ class App(tk.Tk):
         self.link_value_lbls["buf"].configure(fg=color if msbuf > 0.5 * latency else C["text"])
         self.stat_vars["buf_sub"].set(f"of {latency:.0f} ms latency")
         trouble = 2 if ddrop else (1 if dlost or dretx else 0)
-        self._show_bandwidth(rate, f"network send · target {self._target_mbps():g} Mbps"
+        self._show_bandwidth(rate, f"network send · target {self._target_mbps():.1f} Mbps"
                                    + (f" · link ≈ {cap:.0f} Mbps" if cap else ""), trouble)
 
     def _reset_link_stats(self):
@@ -2457,6 +2934,8 @@ class App(tk.Tk):
                     self._handle_slt_line(*payload)
                 elif kind == "sltexit":
                     self._on_slt_exit(*payload)
+                elif kind in ("linktest_progress", "linktest_done", "nettest_progress", "nettest_done"):
+                    self._on_bw_event(kind, payload)
         except queue.Empty:
             pass
 
@@ -2506,6 +2985,8 @@ class App(tk.Tk):
         save_config(self.settings())
         self.want_stream = self.want_preview = False
         self._cancel_retry()
+        if self.bw_test:
+            self.bw_test.stop()
         if self.pump:
             self.pump.stop()
         if self.proc:

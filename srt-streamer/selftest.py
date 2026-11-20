@@ -244,8 +244,45 @@ def main(argv):
         check("returned_to_preview", True)
         app.toggle_preview()
         wait_for(lambda: app.proc is None, 15,
-                 lambda: (check("stopped_cleanly", True), finish()),
+                 lambda: (check("stopped_cleanly", True), step_link_test()),
                  lambda: (check("stopped_cleanly", False, f"proc={app.proc_kind}"), fail("stop failed")))
+
+    def step_link_test():
+        """Bandwidth analyzer: short SRT link test to a local receiver, then apply the recommendation."""
+        if not app.vars["slt"].get():
+            return finish()
+        rx = state["receiver"]
+        if rx and rx.poll() is None:
+            rx.wait(timeout=10)
+        m.LINK_TEST_STEPS[:] = [1, 2, 4]
+        ff = app.vars["ffmpeg"].get()
+        state["receiver2"] = subprocess.Popen(
+            [ff, "-hide_banner", "-loglevel", "quiet", "-i",
+             f"srt://127.0.0.1:{PORT}?mode=listener&passphrase={PASSPHRASE}&pbkeylen=16", "-f", "null", "-"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=m.NO_WINDOW)
+        app.tabbar.select("bandwidth")
+        app.vars["content"].set("film")
+        app.after(1500, app.toggle_link_test)
+        wait_for(lambda: app.bw_test is None and app.bw_measured is not None, 45, step_link_done,
+                 lambda: (check("bandwidth_link_test", False, app.bw_progress.get()), fail("link test failed")))
+
+    def step_link_done():
+        meas = app.bw_measured
+        check("bandwidth_link_test", meas["capacity_kbps"] >= 1500,
+              f"{app.bw_progress.get()} | budget={app.vars['budget'].get()}")
+        screenshot("bandwidth")
+        rec = app.bw_rec
+        before = app.vars["vbitrate"].get()
+        app.apply_recommendation()
+        ok = bool(rec) and app.vars["vbitrate"].get() == str(rec[1]) and app.vars["fps"].get() == str(rec[0]["fps"])
+        check("bandwidth_apply", ok, f"{app.bw_summary.get()} | vbitrate {before} -> {app.vars['vbitrate'].get()}, "
+                                     f"scale={app.vars['scale'].get()} fps={app.vars['fps'].get()} "
+                                     f"latency={app.vars['latency'].get()}")
+        rx2 = state.get("receiver2")
+        if rx2 and rx2.poll() is None:
+            rx2.kill()
+        finish()
 
     def hard_timeout():
         if not os.path.exists(report_path) or os.path.getmtime(report_path) < state["t0"]:

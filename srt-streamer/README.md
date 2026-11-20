@@ -13,6 +13,10 @@ Grab `SRT-Streamer-Windows-x64.zip` from the repo's **Releases** page. It's a si
 - **Stereo peak meters** with peak hold.
 - **Stream health:** bandwidth graph (network send rate vs target, with loss markers), frame rate, dropped frames, uptime.
 - **SRT link statistics** via `srt-live-transmit`: link quality, round-trip time, packet loss, retransmitted and dropped packets, send buffer, estimated link capacity.
+- **Bandwidth analyzer** (Bandwidth tab), tied to the SRT and Encoding settings:
+  - *Test SRT link* ramps a test stream to your actual receiver over SRT (1 → 50 Mbps, padded with MPEG-TS null packets) and finds the highest rate it carries without loss, a filling send buffer or dropped packets.
+  - *Internet test* is a quick general upload check against Cloudflare. You can also type a budget yourself.
+  - It predicts quality for each resolution and frame rate with the VMAF Estimator model (StreamingIdiot.com), using this app's real encoder settings. *Apply* sets resolution, frame rate, bitrate and SRT latency (about 4× RTT).
 - **USB devices:** webcams and capture cards (including their built-in audio) under Video source; microphones, headsets and USB audio interfaces under Audio source.
 - **Clear status** (Offline / Preview / Connecting / Live / Reconnecting) with automatic reconnect.
 - **Computer sound on Windows:** capture what any speaker or headphone output is playing (WASAPI loopback). No Stereo Mix or virtual cable needed.
